@@ -1,0 +1,6 @@
+{
+  "name": "AI Tạo Đề Tương Tự",
+  "description": "Hệ thống AI tạo đề thi tương đương cấu trúc đề mẫu, bảo toàn định dạng LaTeX, hình vẽ SVG và xuất file Word .docx chuẩn giáo dục.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
