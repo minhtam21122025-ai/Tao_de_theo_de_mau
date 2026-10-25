@@ -24,6 +24,18 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
+// Set request timeout to 3 minutes and normalize trailing slashes on all API routes
+app.use((req, res, next) => {
+  req.setTimeout(180000);
+  res.setTimeout(180000);
+  if (req.path.length > 1 && req.path.endsWith('/')) {
+    const newPath = req.path.slice(0, -1);
+    const query = req.url.slice(req.path.length);
+    req.url = newPath + query;
+  }
+  next();
+});
+
 const modelManager = new GeminiModelManager();
 
 // API Health & Model status
@@ -468,6 +480,26 @@ app.post('/api/exam/export-docx', async (req: Request, res: Response) => {
       error: err.message || 'Lỗi khi xuất tệp Word .docx.',
     });
   }
+});
+
+// 404 handler for any unhandled /api/* endpoint to guarantee pure JSON responses (never HTML)
+app.all('/api/*', (req: Request, res: Response) => {
+  res.status(404).json({
+    error: `Đường dẫn API '${req.method} ${req.originalUrl}' không tồn tại trên máy chủ (Mã lỗi 404). Vui lòng kiểm tra lại.`,
+    status: 404,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Global Express error handler to guarantee pure JSON error responses and avoid HTML error leaks
+app.use((err: any, req: Request, res: Response, _next: any) => {
+  console.error('[Unhandled Express Error]:', err);
+  const status = typeof err?.status === 'number' && err.status >= 400 && err.status < 600 ? err.status : 500;
+  res.status(status).json({
+    error: err?.message || 'Lỗi hệ thống máy chủ nội bộ (500). Vui lòng thử lại.',
+    status,
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // Vite middleware in dev or static files in production

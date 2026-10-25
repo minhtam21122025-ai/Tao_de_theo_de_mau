@@ -68,9 +68,7 @@ const PROCESSING_STEPS = [
   'Đang đọc và phân tích tệp tài liệu',
   'Đang nhận dạng OCR và công thức LaTeX ($...$)',
   'Đang thiết lập bản đồ cấu trúc đề mẫu',
-  'Đang tạo các đề thi tương đương (đổi số liệu hợp lệ)',
-  'Đang dựng hình vẽ hình học / đồ thị SVG',
-  'Đang kiểm định chất lượng theo 16 tiêu chí Bộ GD&ĐT',
+  'Đang tạo đề thi tương đương & dựng hình vẽ SVG',
   'Hoàn tất và chuẩn bị tệp Word .docx',
 ];
 
@@ -142,26 +140,46 @@ export default function App() {
   const [selectedQualityModalExam, setSelectedQualityModalExam] = useState<GeneratedExam | null>(null);
   const [currentlyProcessingIndex, setCurrentlyProcessingIndex] = useState<number | null>(null);
   const [totalToGenerate, setTotalToGenerate] = useState<number>(3);
+  const [failedExamIndices, setFailedExamIndices] = useState<number[]>([]);
+  const [retryNotice, setRetryNotice] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const effectiveSubject = subject === 'other' ? customSubject.trim() || 'Môn học' : subject;
   const effectiveGrade = grade === 'other' ? customGrade.trim() || 'Lớp' : grade;
 
-  // Safe JSON parser to prevent "Unexpected token < in JSON"
+  // Safe JSON parser to handle 404, 420, 429, 500, 503, 504 gracefully
   const parseResponseJson = async <T,>(res: Response, defaultMessage: string): Promise<T> => {
     const text = await res.text();
     let json: any;
     try {
       json = JSON.parse(text);
     } catch {
-      if (res.status === 504 || res.status === 502) {
-        throw new Error('Yêu cầu vượt quá thời gian chờ của máy chủ (504 Gateway Timeout). Vui lòng thử lại.');
+      if (res.status === 404) {
+        throw new Error('Đường dẫn dịch vụ không tìm thấy hoặc đã thay đổi (Mã lỗi 404). Hệ thống đang kiểm tra lại kết nối.');
+      }
+      if (res.status === 420 || res.status === 429) {
+        throw new Error('Máy chủ AI đang tiếp nhận lưu lượng lớn (Hạn mức 420/429 Quota). Hệ thống đang kích hoạt chuyển đổi mô hình dự phòng.');
+      }
+      if (res.status === 503 || res.status === 504 || res.status === 502) {
+        throw new Error('Dịch vụ AI đang tạm thời quá tải hoặc phản hồi chậm (Mã lỗi 503/504). Hệ thống đang tự động thử lại.');
+      }
+      if (res.status === 500) {
+        throw new Error('Máy chủ gặp sự cố nội bộ khi xử lý (Mã lỗi 500). Hệ thống đã ghi nhận và khôi phục an toàn.');
       }
       const cleanSnippet = text.replace(/<[^>]*>/g, '').trim().slice(0, 150);
       throw new Error(`${defaultMessage} (Mã lỗi ${res.status}): ${cleanSnippet || 'Phản hồi không phải JSON'}`);
     }
     if (!res.ok) {
+      if (res.status === 404) {
+        throw new Error(json.error || 'Tài nguyên hoặc đường dẫn API không tồn tại (Mã lỗi 404).');
+      }
+      if (res.status === 420 || res.status === 429) {
+        throw new Error(json.error || 'Hạn mức yêu cầu AI tạm thời quá tải (Mã lỗi 420/429). Đang giãn cách và đổi mô hình.');
+      }
+      if (res.status === 503) {
+        throw new Error(json.error || 'Dịch vụ AI tạm thời quá tải (Mã lỗi 503). Đang tự động chuyển sang mô hình Gemini thay thế.');
+      }
       throw new Error(json.error || `${defaultMessage} (Mã lỗi ${res.status})`);
     }
     return json as T;
@@ -253,6 +271,8 @@ export default function App() {
       setIsProcessing(true);
       setCurrentStepIndex(0);
       setErrorMessage(null);
+      setRetryNotice(null);
+      setFailedExamIndices([]);
 
       const res = await fetch('/api/exam/sample');
       const data = await parseResponseJson<{ blueprint: OriginalExamBlueprint }>(res, 'Lỗi khi tải đề mẫu');
@@ -267,7 +287,7 @@ export default function App() {
           mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         });
 
-        // Generate exams one by one for fast feedback and no timeout
+        // Generate exams one by one with auto-retry per exam
         setCurrentStepIndex(3);
         const targetCount = examCount || 3;
         setTotalToGenerate(targetCount);
@@ -275,29 +295,52 @@ export default function App() {
 
         for (let i = 1; i <= targetCount; i++) {
           setCurrentlyProcessingIndex(i);
-          const genRes = await fetch('/api/exam/generate-single', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              blueprint: data.blueprint,
-              index: i,
-              options: { ...advancedOptions, examCount: targetCount, modelStrategy },
-              subject: 'Toán',
-              grade: 'Lớp 8',
-            }),
-          });
+          let success = false;
+          let lastExamError: any = null;
 
-          const genData = await parseResponseJson<{
-            exam: GeneratedExam;
-            logs?: ModelExecutionLog[];
-            activeModel?: string;
-          }>(genRes, `Lỗi khi sinh Đề ${i}`);
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+              if (attempt > 1) {
+                setRetryNotice(`Đề ${i.toString().padStart(2, '0')}: Tự động kết nối lại lần ${attempt} do nghẽn mạng hoặc quá tải máy chủ...`);
+                await new Promise((r) => setTimeout(r, 1500 * attempt));
+              }
 
-          accumulatedExams.push(genData.exam);
-          setGeneratedExams([...accumulatedExams]);
-          if (genData.logs) setLogs(genData.logs);
-          if (genData.activeModel) setActiveModel(genData.activeModel);
-          if (i === 1) setActiveTab('exam_0');
+              const genRes = await fetch('/api/exam/generate-single', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  blueprint: data.blueprint,
+                  index: i,
+                  options: { ...advancedOptions, examCount: targetCount, modelStrategy },
+                  subject: 'Toán',
+                  grade: 'Lớp 8',
+                }),
+              });
+
+              const genData = await parseResponseJson<{
+                exam: GeneratedExam;
+                logs?: ModelExecutionLog[];
+                activeModel?: string;
+              }>(genRes, `Lỗi khi sinh Đề ${i}`);
+
+              accumulatedExams.push(genData.exam);
+              setGeneratedExams([...accumulatedExams]);
+              if (genData.logs) setLogs(genData.logs);
+              if (genData.activeModel) setActiveModel(genData.activeModel);
+              if (i === 1) setActiveTab('exam_0');
+              setRetryNotice(null);
+              success = true;
+              break;
+            } catch (err: any) {
+              lastExamError = err;
+              console.warn(`Thử lần ${attempt} sinh đề ${i} thất bại:`, err.message);
+            }
+          }
+
+          if (!success) {
+            setFailedExamIndices((prev) => [...prev, i]);
+            setErrorMessage(`Đề ${i.toString().padStart(2, '0')} gặp gián đoạn (${lastExamError?.message || 'Lỗi kết nối'}). Thầy cô có thể bấm nút "Thử lại Đề ${i.toString().padStart(2, '0')}" bên dưới.`);
+          }
         }
         setCurrentlyProcessingIndex(null);
         setCurrentStepIndex(6);
@@ -307,6 +350,7 @@ export default function App() {
     } finally {
       setIsProcessing(false);
       setCurrentlyProcessingIndex(null);
+      setRetryNotice(null);
     }
   };
 
@@ -323,6 +367,8 @@ export default function App() {
 
     setIsProcessing(true);
     setErrorMessage(null);
+    setRetryNotice(null);
+    setFailedExamIndices([]);
     setCurrentStepIndex(0);
 
     try {
@@ -352,30 +398,51 @@ export default function App() {
                 grade: effectiveGrade,
               };
 
-        const analyzeRes = await fetch('/api/exam/analyze', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
+        let analyzeSuccess = false;
+        let lastAnalyzeError: any = null;
 
-        const analyzeData = await parseResponseJson<{
-          blueprint: OriginalExamBlueprint;
-          detectedCount?: number;
-          logs?: ModelExecutionLog[];
-          activeModel?: string;
-        }>(analyzeRes, 'Lỗi khi phân tích cấu trúc đề mẫu');
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            if (attempt > 1) {
+              setRetryNotice(`Đang thử phân tích lại cấu trúc đề mẫu lần ${attempt}...`);
+              await new Promise((r) => setTimeout(r, 2000 * attempt));
+            }
+            const analyzeRes = await fetch('/api/exam/analyze', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            });
 
-        currentBlueprint = analyzeData.blueprint;
-        setBlueprint(analyzeData.blueprint);
-        if (analyzeData.logs) setLogs(analyzeData.logs);
-        if (analyzeData.activeModel) setActiveModel(analyzeData.activeModel);
+            const analyzeData = await parseResponseJson<{
+              blueprint: OriginalExamBlueprint;
+              detectedCount?: number;
+              logs?: ModelExecutionLog[];
+              activeModel?: string;
+            }>(analyzeRes, 'Lỗi khi phân tích cấu trúc đề mẫu');
+
+            currentBlueprint = analyzeData.blueprint;
+            setBlueprint(analyzeData.blueprint);
+            if (analyzeData.logs) setLogs(analyzeData.logs);
+            if (analyzeData.activeModel) setActiveModel(analyzeData.activeModel);
+            setRetryNotice(null);
+            analyzeSuccess = true;
+            break;
+          } catch (err: any) {
+            lastAnalyzeError = err;
+            console.warn(`Phân tích đề mẫu lần ${attempt} thất bại:`, err.message);
+          }
+        }
+
+        if (!analyzeSuccess) {
+          throw new Error(lastAnalyzeError?.message || 'Không thể phân tích cấu trúc đề mẫu sau 3 lần thử.');
+        }
       }
 
       if (!currentBlueprint) {
         throw new Error('Chưa nhận dạng được cấu trúc đề mẫu.');
       }
 
-      // Step 3 & 4: Generate N similar exams one by one (isolated & resilient)
+      // Step 3 & 4: Generate N similar exams one by one (isolated & resilient with auto-retry)
       setCurrentStepIndex(3);
       const targetCount = examCount || 3;
       setTotalToGenerate(targetCount);
@@ -383,39 +450,143 @@ export default function App() {
 
       for (let i = 1; i <= targetCount; i++) {
         setCurrentlyProcessingIndex(i);
-        const genRes = await fetch('/api/exam/generate-single', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            blueprint: currentBlueprint,
-            index: i,
-            options: { ...advancedOptions, examCount: targetCount, modelStrategy },
-            subject: effectiveSubject,
-            grade: effectiveGrade,
-          }),
-        });
+        let examSuccess = false;
+        let lastExamError: any = null;
 
-        const genData = await parseResponseJson<{
-          exam: GeneratedExam;
-          logs?: ModelExecutionLog[];
-          activeModel?: string;
-        }>(genRes, `Lỗi khi sinh Đề ${i.toString().padStart(2, '0')}`);
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            if (attempt > 1) {
+              setRetryNotice(`Đề ${i.toString().padStart(2, '0')}: Đang tự động kết nối lại lần ${attempt} do quá tải hoặc nghẽn mạng...`);
+              await new Promise((r) => setTimeout(r, 1500 * attempt));
+            }
 
-        accumulatedExams.push(genData.exam);
-        setGeneratedExams([...accumulatedExams]);
-        if (genData.logs) setLogs(genData.logs);
-        if (genData.activeModel) setActiveModel(genData.activeModel);
-        if (i === 1) setActiveTab('exam_0');
+            const genRes = await fetch('/api/exam/generate-single', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                blueprint: currentBlueprint,
+                index: i,
+                options: { ...advancedOptions, examCount: targetCount, modelStrategy },
+                subject: effectiveSubject,
+                grade: effectiveGrade,
+              }),
+            });
+
+            const genData = await parseResponseJson<{
+              exam: GeneratedExam;
+              logs?: ModelExecutionLog[];
+              activeModel?: string;
+            }>(genRes, `Lỗi khi sinh Đề ${i.toString().padStart(2, '0')}`);
+
+            accumulatedExams.push(genData.exam);
+            setGeneratedExams([...accumulatedExams]);
+            if (genData.logs) setLogs(genData.logs);
+            if (genData.activeModel) setActiveModel(genData.activeModel);
+            if (i === 1) setActiveTab('exam_0');
+            setRetryNotice(null);
+            examSuccess = true;
+            break;
+          } catch (err: any) {
+            lastExamError = err;
+            console.warn(`Lỗi khi tạo đề ${i} (lần ${attempt}):`, err.message);
+          }
+        }
+
+        if (!examSuccess) {
+          // Isolate failure: record failed exam without breaking the whole batch
+          setFailedExamIndices((prev) => [...prev, i]);
+          setErrorMessage(`Đề ${i.toString().padStart(2, '0')} gặp gián đoạn tạm thời (${lastExamError?.message || 'Lỗi mạng'}). Thầy cô có thể bấm nút "Thử lại Đề ${i.toString().padStart(2, '0')}" bên dưới.`);
+        }
       }
 
       setCurrentlyProcessingIndex(null);
-      setCurrentStepIndex(6);
+      setCurrentStepIndex(4);
     } catch (err: any) {
       console.error(err);
       setErrorMessage(err.message || 'Có lỗi xảy ra trong quá trình xử lý.');
     } finally {
       setIsProcessing(false);
       setCurrentlyProcessingIndex(null);
+      setRetryNotice(null);
+    }
+  };
+
+  // Re-run single exam on demand if it previously encountered transient error
+  const handleRetrySingleExam = async (targetIndex: number) => {
+    if (!blueprint) {
+      alert('Chưa có cấu trúc đề mẫu để tạo lại.');
+      return;
+    }
+
+    setIsProcessing(true);
+    setCurrentlyProcessingIndex(targetIndex);
+    setErrorMessage(null);
+    setRetryNotice(`Đang tạo lại Đề ${targetIndex.toString().padStart(2, '0')}...`);
+
+    try {
+      let success = false;
+      let lastErr: any = null;
+
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          if (attempt > 1) {
+            setRetryNotice(`Đang thử lại Đề ${targetIndex.toString().padStart(2, '0')} lần ${attempt}...`);
+            await new Promise((r) => setTimeout(r, 2000 * attempt));
+          }
+
+          const genRes = await fetch('/api/exam/generate-single', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              blueprint,
+              index: targetIndex,
+              options: { ...advancedOptions, examCount: totalToGenerate, modelStrategy },
+              subject: effectiveSubject,
+              grade: effectiveGrade,
+            }),
+          });
+
+          const genData = await parseResponseJson<{
+            exam: GeneratedExam;
+            logs?: ModelExecutionLog[];
+            activeModel?: string;
+          }>(genRes, `Lỗi khi sinh Đề ${targetIndex.toString().padStart(2, '0')}`);
+
+          setGeneratedExams((prev) => {
+            const updated = [...prev];
+            const codeToMatch = `Đề ${targetIndex.toString().padStart(2, '0')}`;
+            const existingIdx = updated.findIndex((e) => e.examCode.includes(codeToMatch));
+            if (existingIdx >= 0) {
+              updated[existingIdx] = genData.exam;
+            } else {
+              updated.push(genData.exam);
+              updated.sort((a, b) => a.examCode.localeCompare(b.examCode));
+            }
+            return updated;
+          });
+
+          setFailedExamIndices((prev) => prev.filter((i) => i !== targetIndex));
+          if (genData.logs) setLogs(genData.logs);
+          if (genData.activeModel) setActiveModel(genData.activeModel);
+          setActiveTab(`exam_${targetIndex - 1}`);
+          setRetryNotice(null);
+          success = true;
+          break;
+        } catch (err: any) {
+          lastErr = err;
+          console.warn(`Lỗi khi tạo lại đề ${targetIndex} lần ${attempt}:`, err.message);
+        }
+      }
+
+      if (!success) {
+        throw new Error(lastErr?.message || 'Không thể tạo đề sau 3 lần thử.');
+      }
+    } catch (err: any) {
+      setErrorMessage(`Không thể tạo Đề ${targetIndex.toString().padStart(2, '0')}: ${err.message}`);
+    } finally {
+      setIsProcessing(false);
+      setCurrentlyProcessingIndex(null);
+      setRetryNotice(null);
     }
   };
 
@@ -517,12 +688,25 @@ export default function App() {
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 space-y-6">
+        {/* Real-time retry/recovery notification banner */}
+        {retryNotice && (
+          <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-2xl flex items-center gap-3 text-amber-900 animate-in fade-in shadow-2xs">
+            <RotateCcw className="w-4 h-4 text-amber-600 animate-spin shrink-0" />
+            <div className="text-xs font-semibold leading-relaxed flex-1">
+              {retryNotice}
+            </div>
+            <span className="text-[10px] font-bold bg-amber-200/60 text-amber-900 px-2 py-0.5 rounded-full shrink-0">
+              Tự động phục hồi
+            </span>
+          </div>
+        )}
+
         {/* Error notification banner if any */}
         {errorMessage && (
           <div className="p-4 bg-rose-50 border border-rose-200 rounded-2xl flex items-start gap-3 text-rose-900 animate-in fade-in">
             <AlertCircle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
             <div className="flex-1">
-              <div className="font-bold text-sm">Thông báo xử lý</div>
+              <div className="font-bold text-sm">Thông báo trạng thái hệ thống</div>
               <p className="text-xs mt-0.5 text-rose-700 leading-relaxed">{errorMessage}</p>
             </div>
             <button
@@ -534,142 +718,102 @@ export default function App() {
           </div>
         )}
 
-        {/* SECTION III: CHỈ CHỌN MÔN VÀ LỚP (GIAO DIỆN CHÍNH TINH GỌN) */}
-        <section className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-xs space-y-6">
-          <div className="flex items-center justify-between border-b border-slate-100 pb-4">
-            <div className="flex items-center gap-2.5">
-              <div className="p-2 bg-blue-50 text-blue-600 rounded-xl">
-                <GraduationCap className="w-5 h-5" />
+        {/* COMPACT INPUT BAR: Môn học, Lớp, Số đề cần tạo */}
+        <section className="bg-white rounded-2xl p-4 sm:p-5 border border-slate-200/80 shadow-xs space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
+            <div className="flex items-center gap-2">
+              <div className="p-1.5 bg-blue-50 text-blue-600 rounded-lg">
+                <GraduationCap className="w-4 h-4" />
               </div>
-              <div>
-                <h2 className="text-base font-bold text-slate-900">
-                  Thông tin đề thi (Chỉ chọn Môn và Lớp)
-                </h2>
-                <p className="text-xs text-slate-500">
-                  Hệ thống tự động suy diễn dạng bài, kiến thức, độ khó và phân bố điểm từ đề mẫu.
-                </p>
-              </div>
+              <h2 className="text-sm font-bold text-slate-900">
+                Thông tin đề thi & Nạp đề mẫu (Thu gọn tối ưu không gian)
+              </h2>
             </div>
 
             <button
               type="button"
               onClick={handleLoadSample}
               disabled={isProcessing}
-              className="text-xs bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-semibold px-3 py-2 rounded-xl border border-indigo-200 transition flex items-center gap-1.5 shadow-2xs"
+              className="text-xs bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-semibold px-3 py-1.5 rounded-lg border border-indigo-200 transition flex items-center gap-1 shadow-2xs"
             >
               <Zap className="w-3.5 h-3.5 text-indigo-600" />
-              Thử ngay với Đề mẫu có sẵn (Toán 8)
+              Thử ngay Đề mẫu (Toán 8)
             </button>
           </div>
 
-          {/* MAIN CONFIGURATION GRID */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {/* Field 1: Môn học */}
-            <div className="space-y-2.5">
-              <label className="text-sm font-bold text-slate-900 flex items-center gap-2">
-                <BookOpen className="w-4 h-4 text-blue-600" />
-                1. Môn học <span className="text-rose-500">*</span>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {/* 1. Môn học */}
+            <div className="space-y-1">
+              <label className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
+                <BookOpen className="w-3.5 h-3.5 text-blue-600" />
+                Môn học <span className="text-rose-500">*</span>
               </label>
-
-              {/* Quick Select Buttons */}
-              <div className="flex flex-wrap gap-1.5">
-                {POPULAR_SUBJECTS.map((sub) => (
-                  <button
-                    key={sub}
-                    type="button"
-                    onClick={() => {
-                      setSubject(sub);
-                      setCustomSubject('');
-                    }}
-                    className={`text-xs px-3 py-1.5 rounded-lg font-medium transition ${
-                      subject === sub
-                        ? 'bg-blue-600 text-white shadow-2xs'
-                        : 'bg-slate-100 hover:bg-slate-200 text-slate-700'
-                    }`}
-                  >
-                    {sub}
-                  </button>
-                ))}
-                <button
-                  type="button"
-                  onClick={() => setSubject('other')}
-                  className={`text-xs px-3 py-1.5 rounded-lg font-medium transition ${
-                    subject === 'other'
-                      ? 'bg-blue-600 text-white shadow-2xs'
-                      : 'bg-slate-100 hover:bg-slate-200 text-slate-700'
-                  }`}
+              <div className="flex gap-1">
+                <select
+                  value={subject}
+                  onChange={(e) => {
+                    setSubject(e.target.value);
+                    if (e.target.value !== 'other') setCustomSubject('');
+                  }}
+                  className="flex-1 text-xs p-2.5 bg-slate-50 border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-500 font-medium"
                 >
-                  Môn khác...
-                </button>
+                  {POPULAR_SUBJECTS.map((sub) => (
+                    <option key={sub} value={sub}>{sub}</option>
+                  ))}
+                  <option value="other">Môn khác...</option>
+                </select>
+                {subject === 'other' && (
+                  <input
+                    type="text"
+                    placeholder="Nhập môn..."
+                    value={customSubject}
+                    onChange={(e) => setCustomSubject(e.target.value)}
+                    className="w-28 text-xs p-2.5 bg-slate-50 border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-500"
+                  />
+                )}
               </div>
-
-              {subject === 'other' && (
-                <input
-                  type="text"
-                  placeholder="Nhập tên môn học..."
-                  value={customSubject}
-                  onChange={(e) => setCustomSubject(e.target.value)}
-                  className="w-full text-sm p-3 border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:outline-hidden"
-                />
-              )}
             </div>
 
-            {/* Field 2: Lớp */}
-            <div className="space-y-2.5">
-              <label className="text-sm font-bold text-slate-900 flex items-center gap-2">
-                <GraduationCap className="w-4 h-4 text-blue-600" />
-                2. Lớp <span className="text-rose-500">*</span>
+            {/* 2. Lớp */}
+            <div className="space-y-1">
+              <label className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
+                <GraduationCap className="w-3.5 h-3.5 text-blue-600" />
+                Khối lớp <span className="text-rose-500">*</span>
               </label>
-
-              {/* Quick Select Grades 1-12 */}
-              <div className="grid grid-cols-4 sm:grid-cols-6 gap-1.5">
-                {GRADES.map((g) => (
-                  <button
-                    key={g}
-                    type="button"
-                    onClick={() => {
-                      setGrade(g);
-                      setCustomGrade('');
-                    }}
-                    className={`text-xs py-1.5 rounded-lg font-medium text-center transition ${
-                      grade === g
-                        ? 'bg-blue-600 text-white shadow-2xs'
-                        : 'bg-slate-100 hover:bg-slate-200 text-slate-700'
-                    }`}
-                  >
-                    {g}
-                  </button>
-                ))}
+              <div className="flex gap-1">
+                <select
+                  value={grade}
+                  onChange={(e) => {
+                    setGrade(e.target.value);
+                    if (e.target.value !== 'other') setCustomGrade('');
+                  }}
+                  className="flex-1 text-xs p-2.5 bg-slate-50 border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-500 font-medium"
+                >
+                  {GRADES.map((g) => (
+                    <option key={g} value={g}>{g}</option>
+                  ))}
+                  <option value="other">Khác...</option>
+                </select>
+                {grade === 'other' && (
+                  <input
+                    type="text"
+                    placeholder="Nhập lớp..."
+                    value={customGrade}
+                    onChange={(e) => setCustomGrade(e.target.value)}
+                    className="w-24 text-xs p-2.5 bg-slate-50 border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-500"
+                  />
+                )}
               </div>
-
-              {grade === 'other' && (
-                <input
-                  type="text"
-                  placeholder="Nhập khối lớp..."
-                  value={customGrade}
-                  onChange={(e) => setCustomGrade(e.target.value)}
-                  className="w-full text-sm p-3 border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:outline-hidden"
-                />
-              )}
             </div>
-          </div>
 
-          {/* ROW 2: SỐ LƯỢNG ĐỀ CẦN TẠO & TỐI ƯU HÓA MÔ HÌNH GEMINI (YÊU CẦU ĐIỀU CHỈNH) */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 pt-2 border-t border-slate-100">
-            {/* Field 3: Số lượng đề cần tạo */}
-            <div className="space-y-2.5">
-              <div className="flex items-center justify-between">
-                <label className="text-sm font-bold text-slate-900 flex items-center gap-2">
-                  <Layers className="w-4 h-4 text-blue-600" />
-                  3. Số lượng đề cần tạo
-                </label>
-                <span className="text-xs font-semibold text-blue-700 bg-blue-50 px-2 py-0.5 rounded-full border border-blue-200">
-                  Đang chọn: {examCount} đề tương đương
-                </span>
-              </div>
-
-              <div className="flex flex-wrap gap-2">
-                {[1, 2, 3, 4, 5, 10].map((num) => (
+            {/* 3. Số đề tạo */}
+            <div className="space-y-1">
+              <label className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
+                <Layers className="w-3.5 h-3.5 text-blue-600" />
+                Số đề cần tạo <span className="text-rose-500">*</span>
+              </label>
+              <div className="flex items-center gap-1">
+                {[1, 2, 3, 5, 10].map((num) => (
                   <button
                     key={num}
                     type="button"
@@ -678,124 +822,31 @@ export default function App() {
                       setCustomExamCount('');
                       setAdvancedOptions((prev) => ({ ...prev, examCount: num }));
                     }}
-                    className={`text-xs font-bold px-3.5 py-2 rounded-xl border transition flex items-center gap-1.5 ${
+                    className={`flex-1 py-2 text-xs font-bold rounded-xl border transition ${
                       examCount === num
-                        ? 'bg-blue-600 text-white border-blue-600 shadow-sm'
+                        ? 'bg-blue-600 text-white border-blue-600 shadow-2xs'
                         : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
                     }`}
                   >
-                    <span>{num} đề</span>
-                    {num === 3 && (
-                      <span className={`text-[10px] px-1 py-0.2 rounded font-normal ${
-                        examCount === 3 ? 'bg-blue-700 text-blue-100' : 'bg-slate-200 text-slate-600'
-                      }`}>
-                        Mặc định
-                      </span>
-                    )}
+                    {num}
                   </button>
                 ))}
-
-                {/* Custom exam count */}
-                <div className="flex items-center gap-1">
-                  <input
-                    type="number"
-                    min="1"
-                    max="15"
-                    placeholder="Khác..."
-                    value={customExamCount}
-                    onChange={(e) => {
-                      const val = parseInt(e.target.value);
-                      setCustomExamCount(e.target.value);
-                      if (val && val > 0 && val <= 15) {
-                        setExamCount(val);
-                        setAdvancedOptions((prev) => ({ ...prev, examCount: val }));
-                      }
-                    }}
-                    className="w-20 text-xs p-2 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:outline-hidden text-center"
-                  />
-                  <span className="text-xs text-slate-500">đề</span>
-                </div>
-              </div>
-              <p className="text-[11px] text-slate-500 italic">
-                * Mỗi đề mới có dữ kiện & số liệu độc lập 100%, bảo toàn cấu trúc đề mẫu và độ khó tương đương.
-              </p>
-            </div>
-
-            {/* Field 4: Mô hình Gemini & Tối ưu câu lệnh */}
-            <div className="space-y-2.5">
-              <div className="flex items-center justify-between">
-                <label className="text-sm font-bold text-slate-900 flex items-center gap-2">
-                  <Zap className="w-4 h-4 text-amber-500" />
-                  4. Chế độ mô hình Gemini & Tốc độ
-                </label>
-                <span className="text-[11px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
-                  Kháng lỗi 429/500/503
-                </span>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setModelStrategy('auto');
-                    setAdvancedOptions((prev) => ({ ...prev, modelStrategy: 'auto' }));
+                <input
+                  type="number"
+                  min="1"
+                  max="15"
+                  placeholder="Khác"
+                  value={customExamCount}
+                  onChange={(e) => {
+                    const val = parseInt(e.target.value);
+                    setCustomExamCount(e.target.value);
+                    if (val && val > 0 && val <= 15) {
+                      setExamCount(val);
+                      setAdvancedOptions((prev) => ({ ...prev, examCount: val }));
+                    }
                   }}
-                  className={`p-2.5 rounded-xl border text-left transition flex flex-col justify-between ${
-                    modelStrategy === 'auto'
-                      ? 'bg-blue-50 border-blue-400 text-blue-900 shadow-2xs'
-                      : 'bg-slate-50 hover:bg-slate-100 border-slate-200 text-slate-700'
-                  }`}
-                >
-                  <div className="text-xs font-bold flex items-center gap-1 text-blue-600">
-                    <Sparkles className="w-3.5 h-3.5" />
-                    Tự động tối ưu
-                  </div>
-                  <div className="text-[10px] text-slate-500 mt-1">
-                    Cân bằng tốc độ & chất lượng, tự đổi mô hình khi quá tải
-                  </div>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    setModelStrategy('fast_lite');
-                    setAdvancedOptions((prev) => ({ ...prev, modelStrategy: 'fast_lite' }));
-                  }}
-                  className={`p-2.5 rounded-xl border text-left transition flex flex-col justify-between ${
-                    modelStrategy === 'fast_lite'
-                      ? 'bg-amber-50 border-amber-400 text-amber-900 shadow-2xs'
-                      : 'bg-slate-50 hover:bg-slate-100 border-slate-200 text-slate-700'
-                  }`}
-                >
-                  <div className="text-xs font-bold flex items-center gap-1 text-amber-700">
-                    <Zap className="w-3.5 h-3.5" />
-                    Siêu tốc 3.1 Lite
-                  </div>
-                  <div className="text-[10px] text-slate-500 mt-1">
-                    Hạn mức RPM cao nhất, phản hồi 2–4s/đề, giảm tối đa 429
-                  </div>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    setModelStrategy('rotate');
-                    setAdvancedOptions((prev) => ({ ...prev, modelStrategy: 'rotate' }));
-                  }}
-                  className={`p-2.5 rounded-xl border text-left transition flex flex-col justify-between ${
-                    modelStrategy === 'rotate'
-                      ? 'bg-indigo-50 border-indigo-400 text-indigo-900 shadow-2xs'
-                      : 'bg-slate-50 hover:bg-slate-100 border-slate-200 text-slate-700'
-                  }`}
-                >
-                  <div className="text-xs font-bold flex items-center gap-1 text-indigo-700">
-                    <RotateCcw className="w-3.5 h-3.5" />
-                    Luân phiên (Rotate)
-                  </div>
-                  <div className="text-[10px] text-slate-500 mt-1">
-                    Luân phiên các model, x3 hạn mức lệnh khi tạo nhiều đề
-                  </div>
-                </button>
+                  className="w-16 text-xs p-2 bg-slate-50 border border-slate-300 rounded-xl text-center font-bold"
+                />
               </div>
             </div>
           </div>
@@ -947,6 +998,34 @@ export default function App() {
               </div>
             )}
           </div>
+
+          {/* Blueprint Section-wise Question Count Summary Card */}
+          {blueprint && (
+            <div className="p-4 bg-emerald-50/70 border border-emerald-200 rounded-2xl space-y-3 animate-in fade-in">
+              <div className="flex items-center justify-between">
+                <div className="text-xs font-bold text-emerald-900 flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                  <span>Kết quả quét đề mẫu: {blueprint.title || 'Đề kiểm tra'}</span>
+                </div>
+                <span className="text-xs font-bold bg-emerald-600 text-white px-3 py-1 rounded-full shadow-2xs">
+                  Tổng số: {blueprint.questions.length} câu hỏi (Bảo đảm 100%)
+                </span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5 text-xs">
+                {blueprint.sections?.map((sec, sIdx) => {
+                  const count = sec.questionIds?.length || 0;
+                  return (
+                    <div key={sec.id || sIdx} className="bg-white p-3 rounded-xl border border-emerald-200 flex items-center justify-between shadow-2xs">
+                      <span className="font-semibold text-slate-800 truncate pr-2">{sec.title || `Phần ${sIdx + 1}`}</span>
+                      <span className="font-bold text-emerald-800 bg-emerald-100 px-2.5 py-1 rounded-md shrink-0">
+                        {count} câu
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           {/* ADVANCED OPTIONS (COLLAPSIBLE ACCORDION) */}
           <div className="border-t border-slate-100 pt-3">
@@ -1124,12 +1203,12 @@ export default function App() {
         {(generatedExams.length > 0 || blueprint) && (
           <section className="space-y-4">
             {/* STEPWISE STATUS STRIP: XỬ LÝ DỨT ĐIỂM TỪNG ĐỀ */}
-            {generatedExams.length > 0 && (
+            {(generatedExams.length > 0 || failedExamIndices.length > 0) && (
               <div className="bg-white rounded-2xl p-4 border border-slate-200 shadow-2xs space-y-3 animate-in fade-in">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="text-xs font-bold text-slate-800 flex items-center gap-2">
                     <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                    <span>Xử lý dứt điểm từng đề (Đã xong {generatedExams.length}/{totalToGenerate} đề):</span>
+                    <span>Xử lý dứt điểm từng đề (Đã hoàn tất {generatedExams.length}/{totalToGenerate} đề):</span>
                   </div>
                   {currentlyProcessingIndex && (
                     <span className="text-xs text-blue-600 font-bold animate-pulse flex items-center gap-1.5 bg-blue-50 px-2.5 py-1 rounded-lg border border-blue-200">
@@ -1141,7 +1220,10 @@ export default function App() {
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                   {Array.from({ length: totalToGenerate }).map((_, idx) => {
-                    const exam = generatedExams[idx];
+                    const exam = generatedExams.find(
+                      (e) => e.examCode.includes(`Đề ${(idx + 1).toString().padStart(2, '0')}`)
+                    ) || generatedExams[idx];
+                    const isFailed = failedExamIndices.includes(idx + 1) && !exam;
                     const isCurrent = currentlyProcessingIndex === idx + 1;
                     const isDone = !!exam;
 
@@ -1151,6 +1233,8 @@ export default function App() {
                         className={`p-3 rounded-xl border flex items-center justify-between gap-2.5 transition ${
                           isDone
                             ? 'bg-emerald-50/60 border-emerald-200 text-emerald-950'
+                            : isFailed
+                            ? 'bg-rose-50/80 border-rose-300 text-rose-950 shadow-2xs'
                             : isCurrent
                             ? 'bg-blue-50/70 border-blue-300 text-blue-900 ring-2 ring-blue-500/20'
                             : 'bg-slate-50 border-slate-200 text-slate-400'
@@ -1160,6 +1244,8 @@ export default function App() {
                           <div className="font-bold text-xs flex items-center gap-1.5">
                             {isDone ? (
                               <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                            ) : isFailed ? (
+                              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
                             ) : isCurrent ? (
                               <RotateCcw className="w-4 h-4 text-blue-600 animate-spin shrink-0" />
                             ) : (
@@ -1168,22 +1254,28 @@ export default function App() {
                               </span>
                             )}
                             <span className="truncate">Đề { (idx + 1).toString().padStart(2, '0') }</span>
-                            {isDone && (
+                            {isDone ? (
                               <span className="text-[10px] bg-emerald-100 text-emerald-800 px-1.5 py-0.2 rounded font-semibold shrink-0">
                                 Dứt điểm
                               </span>
-                            )}
+                            ) : isFailed ? (
+                              <span className="text-[10px] bg-rose-200 text-rose-800 px-1.5 py-0.2 rounded font-semibold shrink-0">
+                                Chưa tạo
+                              </span>
+                            ) : null}
                           </div>
                           <div className="text-[11px] mt-0.5 opacity-80 truncate">
                             {isDone
                               ? `Đủ ${exam.questions.length} câu • Đáp án & SVG`
+                              : isFailed
+                              ? 'Gặp nghẽn AI hoặc quota. Thử lại ngay'
                               : isCurrent
                               ? 'Đang sinh câu hỏi & hình vẽ...'
                               : 'Chờ trong hàng đợi...'}
                           </div>
                         </div>
 
-                        {isDone && (
+                        {isDone ? (
                           <button
                             type="button"
                             onClick={() => handleQuickDownloadSingle(exam)}
@@ -1193,7 +1285,18 @@ export default function App() {
                             <Download className="w-3.5 h-3.5" />
                             Tải Word
                           </button>
-                        )}
+                        ) : isFailed ? (
+                          <button
+                            type="button"
+                            disabled={isProcessing}
+                            onClick={() => handleRetrySingleExam(idx + 1)}
+                            className="px-2.5 py-1.5 bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white rounded-lg text-xs font-bold transition flex items-center gap-1 shrink-0 shadow-2xs"
+                            title={`Tạo lại riêng Đề ${(idx + 1).toString().padStart(2, '0')}`}
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                            Thử lại
+                          </button>
+                        ) : null}
                       </div>
                     );
                   })}
