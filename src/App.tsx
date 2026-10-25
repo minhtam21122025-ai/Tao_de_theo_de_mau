@@ -287,63 +287,57 @@ export default function App() {
           mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         });
 
-        // Generate exams one by one with auto-retry per exam
+        // Generate exams in parallel for maximum speed
         setCurrentStepIndex(3);
         const targetCount = examCount || 3;
         setTotalToGenerate(targetCount);
-        const accumulatedExams: GeneratedExam[] = [];
+        setRetryNotice('Đang tạo song song các đề tương tự (Tốc độ cao)...');
 
-        for (let i = 1; i <= targetCount; i++) {
-          setCurrentlyProcessingIndex(i);
-          let success = false;
-          let lastExamError: any = null;
+        let genSuccess = false;
+        let lastGenErr: any = null;
 
-          for (let attempt = 1; attempt <= 3; attempt++) {
-            try {
-              if (attempt > 1) {
-                setRetryNotice(`Đề ${i.toString().padStart(2, '0')}: Tự động kết nối lại lần ${attempt} do nghẽn mạng hoặc quá tải máy chủ...`);
-                await new Promise((r) => setTimeout(r, 1500 * attempt));
-              }
-
-              const genRes = await fetch('/api/exam/generate-single', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  blueprint: data.blueprint,
-                  index: i,
-                  options: { ...advancedOptions, examCount: targetCount, modelStrategy },
-                  subject: 'Toán',
-                  grade: 'Lớp 8',
-                }),
-              });
-
-              const genData = await parseResponseJson<{
-                exam: GeneratedExam;
-                logs?: ModelExecutionLog[];
-                activeModel?: string;
-              }>(genRes, `Lỗi khi sinh Đề ${i}`);
-
-              accumulatedExams.push(genData.exam);
-              setGeneratedExams([...accumulatedExams]);
-              if (genData.logs) setLogs(genData.logs);
-              if (genData.activeModel) setActiveModel(genData.activeModel);
-              if (i === 1) setActiveTab('exam_0');
-              setRetryNotice(null);
-              success = true;
-              break;
-            } catch (err: any) {
-              lastExamError = err;
-              console.warn(`Thử lần ${attempt} sinh đề ${i} thất bại:`, err.message);
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            if (attempt > 1) {
+              setRetryNotice(`Đang kết nối lại lần ${attempt} để tạo song song...`);
+              await new Promise((r) => setTimeout(r, 2000 * attempt));
             }
-          }
 
-          if (!success) {
-            setFailedExamIndices((prev) => [...prev, i]);
-            setErrorMessage(`Đề ${i.toString().padStart(2, '0')} gặp gián đoạn (${lastExamError?.message || 'Lỗi kết nối'}). Thầy cô có thể bấm nút "Thử lại Đề ${i.toString().padStart(2, '0')}" bên dưới.`);
+            const genRes = await fetch('/api/exam/generate', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                blueprint: data.blueprint,
+                count: targetCount,
+                options: { ...advancedOptions, examCount: targetCount, modelStrategy },
+                subject: 'Toán',
+                grade: 'Lớp 8',
+              }),
+            });
+
+            const genData = await parseResponseJson<{
+              exams: GeneratedExam[];
+              logs?: ModelExecutionLog[];
+              activeModel?: string;
+            }>(genRes, 'Lỗi khi sinh các đề tương tự');
+
+            setGeneratedExams(genData.exams);
+            if (genData.logs) setLogs(genData.logs);
+            if (genData.activeModel) setActiveModel(genData.activeModel);
+            if (genData.exams.length > 0) setActiveTab('exam_0');
+            setRetryNotice(null);
+            genSuccess = true;
+            break;
+          } catch (err: any) {
+            lastGenErr = err;
+            console.warn(`Thử lần ${attempt} tạo đề song song thất bại:`, err.message);
           }
         }
-        setCurrentlyProcessingIndex(null);
-        setCurrentStepIndex(6);
+
+        if (!genSuccess) {
+          throw new Error(lastGenErr?.message || 'Không thể tạo các đề tương tự.');
+        }
+        setCurrentStepIndex(4);
       }
     } catch (err: any) {
       setErrorMessage(err.message || 'Không thể tải đề mẫu.');
@@ -442,61 +436,55 @@ export default function App() {
         throw new Error('Chưa nhận dạng được cấu trúc đề mẫu.');
       }
 
-      // Step 3 & 4: Generate N similar exams one by one (isolated & resilient with auto-retry)
+      // Step 3 & 4: Generate N similar exams in parallel for maximum speed
       setCurrentStepIndex(3);
       const targetCount = examCount || 3;
       setTotalToGenerate(targetCount);
-      const accumulatedExams: GeneratedExam[] = [];
+      setRetryNotice('Đang tạo song song các đề tương tự (Tốc độ cao)...');
 
-      for (let i = 1; i <= targetCount; i++) {
-        setCurrentlyProcessingIndex(i);
-        let examSuccess = false;
-        let lastExamError: any = null;
+      let genSuccess = false;
+      let lastGenErr: any = null;
 
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          try {
-            if (attempt > 1) {
-              setRetryNotice(`Đề ${i.toString().padStart(2, '0')}: Đang tự động kết nối lại lần ${attempt} do quá tải hoặc nghẽn mạng...`);
-              await new Promise((r) => setTimeout(r, 1500 * attempt));
-            }
-
-            const genRes = await fetch('/api/exam/generate-single', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                blueprint: currentBlueprint,
-                index: i,
-                options: { ...advancedOptions, examCount: targetCount, modelStrategy },
-                subject: effectiveSubject,
-                grade: effectiveGrade,
-              }),
-            });
-
-            const genData = await parseResponseJson<{
-              exam: GeneratedExam;
-              logs?: ModelExecutionLog[];
-              activeModel?: string;
-            }>(genRes, `Lỗi khi sinh Đề ${i.toString().padStart(2, '0')}`);
-
-            accumulatedExams.push(genData.exam);
-            setGeneratedExams([...accumulatedExams]);
-            if (genData.logs) setLogs(genData.logs);
-            if (genData.activeModel) setActiveModel(genData.activeModel);
-            if (i === 1) setActiveTab('exam_0');
-            setRetryNotice(null);
-            examSuccess = true;
-            break;
-          } catch (err: any) {
-            lastExamError = err;
-            console.warn(`Lỗi khi tạo đề ${i} (lần ${attempt}):`, err.message);
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          if (attempt > 1) {
+            setRetryNotice(`Đang kết nối lại lần ${attempt} để tạo song song...`);
+            await new Promise((r) => setTimeout(r, 2000 * attempt));
           }
-        }
 
-        if (!examSuccess) {
-          // Isolate failure: record failed exam without breaking the whole batch
-          setFailedExamIndices((prev) => [...prev, i]);
-          setErrorMessage(`Đề ${i.toString().padStart(2, '0')} gặp gián đoạn tạm thời (${lastExamError?.message || 'Lỗi mạng'}). Thầy cô có thể bấm nút "Thử lại Đề ${i.toString().padStart(2, '0')}" bên dưới.`);
+          const genRes = await fetch('/api/exam/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              blueprint: currentBlueprint,
+              count: targetCount,
+              options: { ...advancedOptions, examCount: targetCount, modelStrategy },
+              subject: effectiveSubject,
+              grade: effectiveGrade,
+            }),
+          });
+
+          const genData = await parseResponseJson<{
+            exams: GeneratedExam[];
+            logs?: ModelExecutionLog[];
+            activeModel?: string;
+          }>(genRes, 'Lỗi khi sinh các đề tương tự');
+
+          setGeneratedExams(genData.exams);
+          if (genData.logs) setLogs(genData.logs);
+          if (genData.activeModel) setActiveModel(genData.activeModel);
+          if (genData.exams.length > 0) setActiveTab('exam_0');
+          setRetryNotice(null);
+          genSuccess = true;
+          break;
+        } catch (err: any) {
+          lastGenErr = err;
+          console.warn(`Thử lần ${attempt} tạo đề song song thất bại:`, err.message);
         }
+      }
+
+      if (!genSuccess) {
+        throw new Error(lastGenErr?.message || 'Không thể tạo các đề tương tự.');
       }
 
       setCurrentlyProcessingIndex(null);
