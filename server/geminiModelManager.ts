@@ -235,6 +235,99 @@ export class GeminiModelManager {
     throw new Error(`${friendlyAdvice} Chi tiết: ${lastErrMsg}`);
   }
 
+  /**
+   * Sửa chữa các ký tự escape không hợp lệ trong chuỗi JSON (đặc biệt là công thức LaTeX: \sqrt, \alpha, \ne, \pm...)
+   */
+  private fixInvalidJsonEscapes(str: string): string {
+    let result = '';
+    let inString = false;
+    let i = 0;
+
+    while (i < str.length) {
+      const char = str[i];
+
+      if (!inString) {
+        if (char === '"') {
+          inString = true;
+        }
+        result += char;
+        i++;
+        continue;
+      }
+
+      // Đang ở bên trong chuỗi chuỗi JSON
+      if (char === '"') {
+        inString = false;
+        result += char;
+        i++;
+        continue;
+      }
+
+      if (char === '\\') {
+        const next = str[i + 1];
+        if (next === undefined) {
+          result += '\\\\';
+          i++;
+          continue;
+        }
+
+        // Các ký tự escape JSON chuẩn hợp lệ: ", \, /, b, f, n, r, t
+        if (
+          next === '"' ||
+          next === '\\' ||
+          next === '/' ||
+          next === 'b' ||
+          next === 'f' ||
+          next === 'n' ||
+          next === 'r' ||
+          next === 't'
+        ) {
+          result += char + next;
+          i += 2;
+          continue;
+        }
+
+        // Unicode escape \uXXXX
+        if (next === 'u') {
+          const hex = str.slice(i + 2, i + 6);
+          if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+            result += char + next + hex;
+            i += 6;
+            continue;
+          }
+        }
+
+        // Ký tự escape LaTeX không hợp lệ trong JSON (ví dụ: \s trong \sqrt, \a trong \alpha, \p trong \pm...)
+        // Tự động nhân đôi dấu gạch chéo ngược để biến thành ký tự escape hợp lệ '\\'
+        result += '\\\\';
+        i++;
+        continue;
+      }
+
+      // Xử lý các ký tự xuống dòng / tab chưa escape bên trong chuỗi
+      if (char === '\n') {
+        result += '\\n';
+        i++;
+        continue;
+      }
+      if (char === '\r') {
+        result += '\\r';
+        i++;
+        continue;
+      }
+      if (char === '\t') {
+        result += '\\t';
+        i++;
+        continue;
+      }
+
+      result += char;
+      i++;
+    }
+
+    return result;
+  }
+
   private repairTruncatedJson(str: string): string {
     let s = str.trim();
     s = s.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
@@ -300,13 +393,38 @@ export class GeminiModelManager {
     if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
       cleaned = cleaned.substring(firstBrace, lastBrace + 1);
     } else if (firstBrace !== -1) {
-      cleaned = this.repairTruncatedJson(cleaned);
+      cleaned = cleaned.substring(firstBrace);
     }
+
+    // Fix invalid escape characters (e.g. LaTeX formulas \sqrt, \alpha, \ne)
+    cleaned = this.fixInvalidJsonEscapes(cleaned);
 
     // Fix trailing commas before } or ]
     cleaned = cleaned.replace(/,\s*([}\]])/g, '$1');
 
     return cleaned.trim();
+  }
+
+  /**
+   * Parse JSON an toàn đa tầng, tự động vá lỗi escape LaTeX và cấu trúc JSON bị ngắt
+   */
+  public safeJsonParse<T>(raw: string): T {
+    const cleaned = this.cleanJsonString(raw);
+    try {
+      return JSON.parse(cleaned) as T;
+    } catch (firstErr: any) {
+      console.warn('First JSON parse attempt failed, trying repaired JSON:', firstErr.message);
+      try {
+        const repaired = this.repairTruncatedJson(cleaned);
+        const fixedRepaired = this.fixInvalidJsonEscapes(repaired);
+        return JSON.parse(fixedRepaired) as T;
+      } catch (secondErr: any) {
+        // Fallback khẩn cấp: thay thế toàn bộ ký tự backslash đơn lẻ không phải escape JSON chuẩn
+        const aggressive = cleaned.replace(/\\([^"\\/bfnrtu]|u(?![\da-fA-F]{4}))/g, '\\\\$1');
+        const aggressiveRepaired = this.repairTruncatedJson(aggressive);
+        return JSON.parse(aggressiveRepaired) as T;
+      }
+    }
   }
 
   /**
@@ -489,14 +607,7 @@ YÊU CẦU ĐẦU RA: Trả về DUY NHẤT một JSON hợp lệ (không kèm l
         },
       });
 
-      const cleaned = this.cleanJsonString(response.text || '{}');
-      let parsed: OriginalExamBlueprint;
-      try {
-        parsed = JSON.parse(cleaned);
-      } catch (err: any) {
-        console.warn('First JSON parse attempt failed, trying repaired JSON:', err.message);
-        parsed = JSON.parse(this.repairTruncatedJson(cleaned));
-      }
+      const parsed: OriginalExamBlueprint = this.safeJsonParse<OriginalExamBlueprint>(response.text || '{}');
 
       if (!parsed.questions || !Array.isArray(parsed.questions) || parsed.questions.length === 0) {
         throw new Error('Không trích xuất được câu hỏi nào từ tài liệu đề mẫu.');
@@ -548,13 +659,7 @@ Yêu cầu đầu ra: Trả về JSON chứa mảng "questions" gồm ${missingC
             },
           });
 
-          const followUpCleaned = this.cleanJsonString(followUpRes.text || '{}');
-          let followUpParsed: any;
-          try {
-            followUpParsed = JSON.parse(followUpCleaned);
-          } catch {
-            followUpParsed = JSON.parse(this.repairTruncatedJson(followUpCleaned));
-          }
+          const followUpParsed: any = this.safeJsonParse<any>(followUpRes.text || '{}');
           if (followUpParsed && followUpParsed.questions && Array.isArray(followUpParsed.questions)) {
             parsed.questions.push(...followUpParsed.questions);
             this.addLog(
@@ -680,13 +785,7 @@ YÊU CẦU ĐẦU RA: Trả về DUY NHẤT một JSON hợp lệ (không kèm m
           },
         });
 
-        const cleaned = this.cleanJsonString(response.text || '{}');
-        let rawResult: any;
-        try {
-          rawResult = JSON.parse(cleaned);
-        } catch {
-          rawResult = JSON.parse(this.repairTruncatedJson(cleaned));
-        }
+        const rawResult: any = this.safeJsonParse<any>(response.text || '{}');
 
         if (!rawResult.questions || !Array.isArray(rawResult.questions)) {
           throw new Error(`Kết quả sinh đề ${examCode} không chứa danh sách câu hỏi hợp lệ.`);
@@ -743,13 +842,7 @@ Yêu cầu:
                 },
               });
 
-              const recoverCleaned = this.cleanJsonString(recoverRes.text || '{}');
-              let recoverParsed: any;
-              try {
-                recoverParsed = JSON.parse(recoverCleaned);
-              } catch {
-                recoverParsed = JSON.parse(this.repairTruncatedJson(recoverCleaned));
-              }
+              const recoverParsed: any = this.safeJsonParse<any>(recoverRes.text || '{}');
 
               if (recoverParsed && recoverParsed.questions && Array.isArray(recoverParsed.questions)) {
                 generatedQuestionsList.push(...recoverParsed.questions);
@@ -977,13 +1070,7 @@ Trả về DUY NHẤT một JSON hợp lệ:
           },
         });
 
-        const cleaned = this.cleanJsonString(response.text || '{}');
-        let parsed: any;
-        try {
-          parsed = JSON.parse(cleaned);
-        } catch {
-          parsed = JSON.parse(this.repairTruncatedJson(cleaned));
-        }
+        const parsed: any = this.safeJsonParse<any>(response.text || '{}');
 
         const qType = parsed.type || originalQuestion.type || 'multiple_choice';
         return {
