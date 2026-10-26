@@ -83,6 +83,7 @@ export interface OriginalExamBlueprint {
   }[];
   questions: QuestionBlueprint[];
   rawTextPreview?: string;
+  transcribedLatexText?: string;
   warnings?: string[];
 }
 

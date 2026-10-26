@@ -19,7 +19,7 @@ import type { GeneratedExam, ExamQuestion } from '../src/types/exam.js';
 export interface DocxExportOptions {
   includeAnswers: boolean;
   includeExplanations: boolean;
-  mode: 'single' | 'all_combined' | 'answers_only' | 'exam_and_answers';
+  mode: 'single' | 'all_combined' | 'answers_only' | 'exam_and_answers' | 'exam_only' | 'all_exams_only';
 }
 
 export class DocxGenerator {
@@ -31,6 +31,11 @@ export class DocxGenerator {
     options: DocxExportOptions
   ): Promise<Buffer> {
     const docChildren: (Paragraph | Table)[] = [];
+
+    const isExamOnly =
+      options.mode === 'exam_only' ||
+      options.mode === 'all_exams_only' ||
+      options.includeAnswers === false;
 
     exams.forEach((exam, index) => {
       // Add page break between multiple exams
@@ -45,8 +50,8 @@ export class DocxGenerator {
         // Xuất Đề kiểm tra
         this.appendExamSection(docChildren, exam);
 
-        // Kèm đáp án ở cuối đề nếu được yêu cầu
-        if (options.includeAnswers || options.mode === 'exam_and_answers') {
+        // Kèm đáp án ở cuối đề nếu được yêu cầu (và không phải chế độ chỉ xuất đề riêng)
+        if (!isExamOnly && (options.includeAnswers || options.mode === 'exam_and_answers')) {
           docChildren.push(new Paragraph({ children: [new PageBreak()] }));
           this.appendAnswersSection(docChildren, exam, options);
         }
@@ -174,15 +179,19 @@ export class DocxGenerator {
         );
       }
 
-      // Nội dung câu hỏi
+      // Làm sạch triệt để nội dung câu hỏi để không bao giờ bị lặp từ "Câu..."
+      const cleanedContent = DocxGenerator.cleanQuestionContent(q.content, q.order);
+      const scoreLabel = q.score ? `(${q.score} điểm)` : '';
+      const questionPrefix = scoreLabel ? `Câu ${q.order} ${scoreLabel}: ` : `Câu ${q.order}: `;
+
       const questionRuns: TextRun[] = [
         new TextRun({
-          text: `Câu ${q.order} (${q.score ? q.score + ' điểm' : ''}): `,
+          text: questionPrefix,
           bold: true,
           font: 'Times New Roman',
         }),
         new TextRun({
-          text: q.content,
+          text: cleanedContent,
           font: 'Times New Roman',
         }),
       ];
@@ -254,8 +263,9 @@ export class DocxGenerator {
 
       // Các phương án trắc nghiệm nếu có
       if (q.options && q.options.length > 0) {
-        // Sắp xếp 2 phương án mỗi hàng hoặc 1 phương án mỗi hàng
+        // Sắp xếp các phương án và loại bỏ tiền tố A., B., C., D. bị lặp
         q.options.forEach((opt) => {
+          const cleanText = DocxGenerator.cleanOptionText(opt.text, opt.key);
           children.push(
             new Paragraph({
               indent: { left: 400 },
@@ -267,7 +277,7 @@ export class DocxGenerator {
                   font: 'Times New Roman',
                 }),
                 new TextRun({
-                  text: opt.text,
+                  text: cleanText,
                   font: 'Times New Roman',
                 }),
               ],
@@ -433,13 +443,14 @@ export class DocxGenerator {
         );
 
         if (q.explanation) {
+          const cleanExpl = DocxGenerator.cleanExplanationText(q.explanation, q.order);
           children.push(
             new Paragraph({
               indent: { left: 400 },
               spacing: { before: 40, after: 80 },
               children: [
                 new TextRun({
-                  text: q.explanation,
+                  text: cleanExpl,
                   font: 'Times New Roman',
                 }),
               ],
@@ -546,5 +557,78 @@ export class DocxGenerator {
       console.warn('[DocxGenerator] Không thể render SVG sang PNG cho Word:', err);
       return null;
     }
+  }
+
+  /**
+   * Làm sạch nội dung câu hỏi, loại bỏ hoàn toàn các tiền tố lặp như "Câu 1:", "Câu 1.", "Câu 1 (0.5 điểm):", "Bài 1:"
+   */
+  public static cleanQuestionContent(content?: string, order?: number): string {
+    if (!content || typeof content !== 'string') return '';
+    let cleaned = content.trim();
+
+    // Vòng lặp loại bỏ triệt để các tiền tố lặp lại ở đầu chuỗi (ví dụ: "Câu 1: Câu 1: Cho...")
+    let changed = true;
+    let loops = 0;
+    while (changed && loops < 5) {
+      loops++;
+      const prev = cleaned;
+
+      // 1. Loại bỏ "Câu X", "Bài X", "Question X", "Câu hỏi X", có thể kèm theo điểm "(0.5 điểm)" và dấu ":", ".", "-", ")"
+      cleaned = cleaned
+        .replace(/^(?:câu|bài|question|câu\s*hỏi)\s*\d*(?:\s*\([^)]*\))?[\s.:)-]*/i, '')
+        .trim();
+
+      // 2. Loại bỏ tiền tố số thứ tự đơn thuần nếu khớp với số câu (ví dụ: "1. Cho...", "1) Cho...")
+      if (order !== undefined) {
+        const numPattern = new RegExp(`^${order}[.:)-]\\s*`, 'i');
+        cleaned = cleaned.replace(numPattern, '').trim();
+      }
+
+      // 3. Loại bỏ các phần điểm số mồ côi ở đầu như "(0.5 điểm):", "(1đ):", "(2 điểm)."
+      cleaned = cleaned
+        .replace(/^\(\s*\d+(?:[.,]\d+)?\s*(?:đ|điểm|pts?)\s*\)[\s.:)-]*/i, '')
+        .trim();
+
+      // 4. Loại bỏ các dấu phân cách mồ côi như ":", "-", "." ở đầu chuỗi nếu còn sót
+      cleaned = cleaned.replace(/^[\s.:)-]+/, '').trim();
+
+      changed = cleaned !== prev;
+    }
+
+    return cleaned;
+  }
+
+  /**
+   * Làm sạch phương án trắc nghiệm, loại bỏ tiền tố A., B., C., D. bị lặp lại
+   */
+  public static cleanOptionText(text?: string, key?: string): string {
+    if (!text || typeof text !== 'string') return '';
+    let cleaned = text.trim();
+
+    // Loại bỏ tiền tố A., B., C., D., A), (A), v.v.
+    cleaned = cleaned.replace(/^\(?[A-Da-d]\)?[\s.:)-]+/, '').trim();
+
+    // Nếu truyền key cụ thể (ví dụ 'A'), kiểm tra thêm trường hợp đặc thù
+    if (key) {
+      const keyPattern = new RegExp(`^\\(?${key}\\)?[\\s.:)-]*`, 'i');
+      cleaned = cleaned.replace(keyPattern, '').trim();
+    }
+
+    return cleaned;
+  }
+
+  /**
+   * Làm sạch lời giải, loại bỏ tiền tố thừa như "Câu 1: Lời giải:", "Lời giải:" nếu có
+   */
+  public static cleanExplanationText(explanation?: string, order?: number): string {
+    if (!explanation || typeof explanation !== 'string') return '';
+    let cleaned = explanation.trim();
+
+    // Loại bỏ "Câu X:", "Bài X:", "Câu X - Hướng dẫn giải:"
+    cleaned = cleaned
+      .replace(/^(?:câu|bài|question)\s*\d*[\s.:)-]*(?:lời\s*giải|hướng\s*dẫn\s*giải)?[\s.:)-]*/i, '')
+      .trim();
+
+    return cleaned;
   }
 }

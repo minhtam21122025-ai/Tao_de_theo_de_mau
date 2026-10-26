@@ -3,6 +3,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import mammoth from 'mammoth';
+import WordExtractor from 'word-extractor';
 import { GeminiModelManager } from './server/geminiModelManager.js';
 import { DocxGenerator } from './server/docxGenerator.js';
 import type {
@@ -24,10 +25,10 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Set request timeout to 3 minutes and normalize trailing slashes on all API routes
+// Set request timeout to 4 minutes (240000ms) to prevent 504 Gateway Timeout during heavy LLM exam generation
 app.use((req, res, next) => {
-  req.setTimeout(180000);
-  res.setTimeout(180000);
+  req.setTimeout(240000);
+  res.setTimeout(240000);
   if (req.path.length > 1 && req.path.endsWith('/')) {
     const newPath = req.path.slice(0, -1);
     const query = req.url.slice(req.path.length);
@@ -259,8 +260,109 @@ app.post('/api/exam/pre-scan', (req: Request, res: Response) => {
   });
 });
 
-// API: Analyze Exam Document (OCR + Structure Blueprint)
-app.post('/api/exam/analyze', async (req: Request, res: Response) => {
+/**
+ * Trích xuất nội dung văn bản từ tài liệu Word (.doc binary format Word 97-2003 và .docx OpenXML)
+ */
+async function extractWordDocumentText(buffer: Buffer, fileName?: string): Promise<string> {
+  const isDocLegacy = fileName?.toLowerCase().endsWith('.doc');
+
+  // 1. Nếu là file .doc (Word 97-2003 OLE2 binary), ưu tiên dùng WordExtractor
+  if (isDocLegacy) {
+    try {
+      const extractor = new WordExtractor();
+      const extracted = await extractor.extract(buffer);
+      const text = [
+        extracted.getHeaders(),
+        extracted.getBody(),
+        extracted.getFootnotes(),
+      ]
+        .filter(Boolean)
+        .join('\n\n')
+        .trim();
+      if (text.length > 20) {
+        console.log(`[DOC Extractor] Trích xuất thành công ${text.length} ký tự từ file .doc bằng WordExtractor`);
+        return text;
+      }
+    } catch (err: any) {
+      console.warn('[DOC Extractor Warning]:', err?.message || err);
+    }
+  }
+
+  // 2. Thử mammoth (chuẩn cho file .docx XML)
+  try {
+    const mammothResult = await mammoth.extractRawText({ buffer });
+    const text = (mammothResult.value || '').trim();
+    if (text.length > 20) {
+      return text;
+    }
+  } catch (err: any) {
+    console.warn('[DOCX Mammoth Warning]:', err?.message || err);
+  }
+
+  // 3. Nếu mammoth không đọc được hoặc file là .doc đổi đuôi, thử với WordExtractor
+  try {
+    const extractor = new WordExtractor();
+    const extracted = await extractor.extract(buffer);
+    const text = [
+      extracted.getHeaders(),
+      extracted.getBody(),
+      extracted.getFootnotes(),
+    ]
+      .filter(Boolean)
+      .join('\n\n')
+      .trim();
+    if (text.length > 20) {
+      return text;
+    }
+  } catch (err: any) {
+    console.warn('[WordExtractor Fallback Warning]:', err?.message || err);
+  }
+
+  // 4. Cứu hộ chuỗi nhị phân (quét UTF-16LE và bảng mã Unicode tiếng Việt trong file .doc)
+  try {
+    const salvaged = salvageTextFromBinaryBuffer(buffer);
+    if (salvaged.length > 30) {
+      console.log(`[DOC Salvage] Trích xuất cứu hộ thành công ${salvaged.length} ký tự từ file nhị phân.`);
+      return salvaged;
+    }
+  } catch (err: any) {
+    console.warn('[DOC Salvage Warning]:', err?.message || err);
+  }
+
+  return '';
+}
+
+/**
+ * Trích xuất chuỗi có nghĩa từ file nhị phân Word .doc (hỗ trợ UTF-16LE và ký tự tiếng Việt)
+ */
+function salvageTextFromBinaryBuffer(buffer: Buffer): string {
+  const strings: string[] = [];
+  let current = '';
+  for (let i = 0; i < buffer.length - 1; i += 2) {
+    const charCode = buffer.readUInt16LE(i);
+    // Ký tự ASCII in được, ký tự xuống dòng và bảng mã Unicode tiếng Việt
+    if (
+      (charCode >= 32 && charCode <= 126) ||
+      charCode === 10 ||
+      charCode === 13 ||
+      (charCode >= 0x00c0 && charCode <= 0x1ef9)
+    ) {
+      current += String.fromCharCode(charCode);
+    } else {
+      if (current.trim().length >= 4) {
+        strings.push(current.trim());
+      }
+      current = '';
+    }
+  }
+  if (current.trim().length >= 4) {
+    strings.push(current.trim());
+  }
+  return strings.join(' ').replace(/\s+/g, ' ').trim();
+}
+
+// API: Bước 1 - Chuyển đổi nội dung đề mẫu sang văn bản chuẩn LaTeX ($...$)
+app.post('/api/exam/transcribe-latex', async (req: Request, res: Response) => {
   try {
     const { base64Data, mimeType, fileName, textContent, subject, grade } = req.body;
 
@@ -272,21 +374,22 @@ app.post('/api/exam/analyze', async (req: Request, res: Response) => {
     let finalMimeType = mimeType;
     let extractedText = (textContent || '').trim();
 
-    // If it's a DOCX file, extract text via mammoth and clear binary (Gemini doesn't support docx inlineData)
-    const isDocx =
+    const isWordFile =
       mimeType?.includes('wordprocessingml') ||
+      mimeType?.includes('msword') ||
+      mimeType?.includes('officedocument') ||
       fileName?.toLowerCase().endsWith('.docx') ||
       fileName?.toLowerCase().endsWith('.doc');
 
-    if (base64Data && isDocx) {
+    if (base64Data && isWordFile) {
       try {
         const buffer = Buffer.from(base64Data, 'base64');
-        const mammothResult = await mammoth.extractRawText({ buffer });
-        extractedText = (mammothResult.value || '').trim();
+        const text = await extractWordDocumentText(buffer, fileName);
+        if (text) extractedText = text;
         finalBase64 = undefined;
         finalMimeType = undefined;
       } catch (err: any) {
-        console.warn('DOCX text extraction error with mammoth:', err);
+        console.warn('Word file text extraction error:', err);
       }
     } else if (
       base64Data &&
@@ -303,12 +406,7 @@ app.post('/api/exam/analyze', async (req: Request, res: Response) => {
       }
     }
 
-    const preAnchors = modelManager.detectQuestionAnchors(extractedText);
-    if (preAnchors.length > 0) {
-      console.log(`[API Analyze] Nhận diện sơ bộ ${preAnchors.length} câu: ${preAnchors.map(a => a.label).join(', ')}`);
-    }
-
-    const blueprint = await modelManager.analyzeExamDocument({
+    const latexText = await modelManager.transcribeDocumentToLatex({
       base64Data: finalBase64,
       mimeType: finalMimeType,
       textContent: extractedText,
@@ -317,7 +415,85 @@ app.post('/api/exam/analyze', async (req: Request, res: Response) => {
     });
 
     res.json({
+      latexText,
+      logs: modelManager.getLogs(),
+      activeModel: modelManager.getActiveModel(),
+    });
+  } catch (err: any) {
+    console.error('Error transcribing to LaTeX:', err);
+    res.status(500).json({
+      error: err.message || 'Lỗi khi chuyển đổi sang chuẩn LaTeX.',
+      logs: modelManager.getLogs(),
+      activeModel: modelManager.getActiveModel(),
+    });
+  }
+});
+
+// API: Bước 2 - Phân tích cấu trúc & OCR đề gốc từ văn bản LaTeX chuẩn
+app.post('/api/exam/analyze', async (req: Request, res: Response) => {
+  try {
+    const { base64Data, mimeType, fileName, textContent, latexText, subject, grade } = req.body;
+
+    if (!subject || !grade) {
+      return res.status(400).json({ error: 'Vui lòng cung cấp thông tin Môn học và Lớp.' });
+    }
+
+    let finalBase64 = base64Data;
+    let finalMimeType = mimeType;
+    let extractedText = (textContent || '').trim();
+
+    // If it's a Word file (.doc or .docx), extract text with WordExtractor/mammoth and clear binary
+    const isWordFile =
+      mimeType?.includes('wordprocessingml') ||
+      mimeType?.includes('msword') ||
+      mimeType?.includes('officedocument') ||
+      fileName?.toLowerCase().endsWith('.docx') ||
+      fileName?.toLowerCase().endsWith('.doc');
+
+    if (base64Data && isWordFile) {
+      try {
+        const buffer = Buffer.from(base64Data, 'base64');
+        const text = await extractWordDocumentText(buffer, fileName);
+        if (text) {
+          extractedText = text;
+        }
+        finalBase64 = undefined;
+        finalMimeType = undefined;
+      } catch (err: any) {
+        console.warn('Word file text extraction error:', err);
+      }
+    } else if (
+      base64Data &&
+      (mimeType?.includes('text/plain') ||
+        fileName?.toLowerCase().endsWith('.txt') ||
+        fileName?.toLowerCase().endsWith('.md'))
+    ) {
+      try {
+        extractedText = Buffer.from(base64Data, 'base64').toString('utf-8').trim();
+        finalBase64 = undefined;
+        finalMimeType = undefined;
+      } catch (err: any) {
+        console.warn('TXT text extraction error:', err);
+      }
+    }
+
+    const preAnchors = modelManager.detectQuestionAnchors(latexText || extractedText);
+    if (preAnchors.length > 0) {
+      console.log(`[API Analyze] Nhận diện sơ bộ ${preAnchors.length} câu: ${preAnchors.map(a => a.label).join(', ')}`);
+    }
+
+    const blueprint = await modelManager.analyzeExamDocument({
+      base64Data: finalBase64,
+      mimeType: finalMimeType,
+      textContent: extractedText,
+      latexText,
+      subject,
+      grade,
+    });
+
+    res.json({
       blueprint,
+      transcribedLatexText: blueprint.transcribedLatexText,
       detectedCount: blueprint.questions.length,
       preDetectedCount: preAnchors.length,
       logs: modelManager.getLogs(),
@@ -518,9 +694,13 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`AI Tạo Đề Tương Tự server running at http://0.0.0.0:${PORT}`);
   });
+  // Prevent 504 Gateway Timeout during heavy LLM generation
+  server.timeout = 240000;
+  server.keepAliveTimeout = 65000;
+  server.headersTimeout = 66000;
 }
 
 startServer();

@@ -17,6 +17,12 @@ import {
   RotateCcw,
   Zap,
   Download,
+  Clipboard,
+  Image as ImageIcon,
+  Camera,
+  Copy,
+  Check,
+  Code,
 } from 'lucide-react';
 import type {
   SubjectName,
@@ -65,11 +71,11 @@ const GRADES: GradeLevel[] = [
 ];
 
 const PROCESSING_STEPS = [
-  'Đang đọc và phân tích tệp tài liệu',
-  'Đang nhận dạng OCR và công thức LaTeX ($...$)',
-  'Đang thiết lập bản đồ cấu trúc đề mẫu',
-  'Đang tạo đề thi tương đương & dựng hình vẽ SVG',
-  'Hoàn tất và chuẩn bị tệp Word .docx',
+  'Đang nạp và kiểm tra tài liệu đề mẫu',
+  'Bước 1: Chuyển toàn bộ nội dung đề sang chuẩn LaTeX ($...$)',
+  'Bước 2: Phân tích cấu trúc & OCR đề gốc chuẩn (100% câu)',
+  'Đang tạo song song các đề tương đương & dựng hình vẽ SVG',
+  'Hoàn tất và sẵn sàng xuất bản file Word .docx',
 ];
 
 export default function App() {
@@ -89,6 +95,8 @@ export default function App() {
     name: string;
     sizeFormatted: string;
     previewText?: string;
+    previewUrl?: string;
+    isScreenshot?: boolean;
   } | null>(null);
 
   // Quick client-side question counter
@@ -142,6 +150,8 @@ export default function App() {
   const [totalToGenerate, setTotalToGenerate] = useState<number>(3);
   const [failedExamIndices, setFailedExamIndices] = useState<number[]>([]);
   const [retryNotice, setRetryNotice] = useState<string | null>(null);
+  const [showLatexSource, setShowLatexSource] = useState(false);
+  const [copiedLatex, setCopiedLatex] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -161,8 +171,11 @@ export default function App() {
       if (res.status === 420 || res.status === 429) {
         throw new Error('Máy chủ AI đang tiếp nhận lưu lượng lớn (Hạn mức 420/429 Quota). Hệ thống đang kích hoạt chuyển đổi mô hình dự phòng.');
       }
-      if (res.status === 503 || res.status === 504 || res.status === 502) {
-        throw new Error('Dịch vụ AI đang tạm thời quá tải hoặc phản hồi chậm (Mã lỗi 503/504). Hệ thống đang tự động thử lại.');
+      if (res.status === 504 || (res.status >= 500 && text.includes('504')) || text.toLowerCase().includes('gateway timeout')) {
+        throw new Error('Mã lỗi 504 (Gateway Timeout): Máy chủ quá thời gian chờ khi xử lý đề dài. Hệ thống đang tự động kích hoạt mô hình siêu tốc Flash-Lite để hoàn tất ngay.');
+      }
+      if (res.status === 503 || res.status === 502) {
+        throw new Error('Dịch vụ AI đang tạm thời quá tải hoặc phản hồi chậm (Mã lỗi 503/502). Hệ thống đang tự động thử lại.');
       }
       if (res.status === 500) {
         throw new Error('Máy chủ gặp sự cố nội bộ khi xử lý (Mã lỗi 500). Hệ thống đã ghi nhận và khôi phục an toàn.');
@@ -177,6 +190,9 @@ export default function App() {
       if (res.status === 420 || res.status === 429) {
         throw new Error(json.error || 'Hạn mức yêu cầu AI tạm thời quá tải (Mã lỗi 420/429). Đang giãn cách và đổi mô hình.');
       }
+      if (res.status === 504 || json.error?.includes('504') || json.error?.toLowerCase()?.includes('gateway timeout')) {
+        throw new Error(json.error || 'Mã lỗi 504 (Gateway Timeout): Xử lý vượt quá giới hạn thời gian. Đang tự động đổi sang mô hình siêu tốc.');
+      }
       if (res.status === 503) {
         throw new Error(json.error || 'Dịch vụ AI tạm thời quá tải (Mã lỗi 503). Đang tự động chuyển sang mô hình Gemini thay thế.');
       }
@@ -185,12 +201,13 @@ export default function App() {
     return json as T;
   };
 
-  // Quick download individual exam .docx immediately upon completion
-  const handleQuickDownloadSingle = async (exam: GeneratedExam) => {
+  // Quick download individual exam .docx immediately upon completion (exam only or with answers)
+  const handleQuickDownloadSingle = async (exam: GeneratedExam, includeAnswers = false) => {
     try {
       const cleanSubject = exam.subject.replace(/[^a-zA-Z0-9\u00C0-\u1EF9]/g, '_');
       const cleanGrade = exam.grade.replace(/[^a-zA-Z0-9\u00C0-\u1EF9]/g, '_');
-      const fileName = `De_kiem_tra_${cleanSubject}_${cleanGrade}_${exam.examCode.replace(/\s+/g, '_')}.docx`;
+      const prefix = includeAnswers ? 'De_va_dap_an' : 'De_rieng';
+      const fileName = `${prefix}_${cleanSubject}_${cleanGrade}_${exam.examCode.replace(/\s+/g, '_')}.docx`;
 
       const response = await fetch('/api/exam/export-docx', {
         method: 'POST',
@@ -198,9 +215,9 @@ export default function App() {
         body: JSON.stringify({
           exams: [exam],
           options: {
-            includeAnswers: true,
-            includeExplanations: true,
-            mode: 'single',
+            includeAnswers,
+            includeExplanations: includeAnswers,
+            mode: includeAnswers ? 'exam_and_answers' : 'exam_only',
           },
           fileName,
         }),
@@ -239,7 +256,120 @@ export default function App() {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
 
-  // Handle file select
+  // Process image file (from upload, drag-and-drop, or clipboard screenshot paste)
+  const processImageFile = (file: File, isFromClipboard = false) => {
+    if (file.size > 25 * 1024 * 1024) {
+      alert('Tệp ảnh quá lớn. Vui lòng chọn ảnh dưới 25MB.');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      const base64Data = result.split(',')[1];
+      const timeStr = new Date().toLocaleTimeString('vi-VN').replace(/:/g, '-');
+      const fileName = isFromClipboard
+        ? `Anh_chup_man_hinh_${timeStr}.png`
+        : file.name;
+      setUploadedFile({
+        file,
+        base64Data,
+        mimeType: file.type || 'image/png',
+        name: fileName,
+        sizeFormatted: formatSize(file.size),
+        previewUrl: result,
+        isScreenshot: isFromClipboard,
+      });
+      setInputMode('upload');
+      setErrorMessage(null);
+      if (isFromClipboard) {
+        setRetryNotice('📸 Đã nhận diện ảnh chụp màn hình từ khay nhớ tạm (Clipboard)! Sẵn sàng quét đề.');
+        setTimeout(() => setRetryNotice(null), 4000);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // Global clipboard paste listener (Ctrl + V / Cmd + V) to capture screenshots anytime
+  useEffect(() => {
+    const handleGlobalPaste = (e: ClipboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const isInput =
+        target?.tagName === 'INPUT' ||
+        target?.tagName === 'TEXTAREA' ||
+        target?.isContentEditable;
+
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      // 1. Check for image items (Screenshot via Win+Shift+S, Cmd+Shift+4, PrintScreen)
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.type.indexOf('image') !== -1) {
+          const blob = item.getAsFile();
+          if (blob) {
+            e.preventDefault();
+            processImageFile(blob, true);
+            return;
+          }
+        }
+      }
+
+      // 2. If not inside an input and user pasted text, auto-populate text mode
+      if (!isInput) {
+        const text = e.clipboardData?.getData('text/plain');
+        if (text && text.trim().length > 20) {
+          setInputMode('text');
+          setPastedExamText(text.trim());
+          setRetryNotice(`Đã dán ${text.trim().length} ký tự đề thi từ khay nhớ tạm!`);
+          setTimeout(() => setRetryNotice(null), 3500);
+        }
+      }
+    };
+
+    window.addEventListener('paste', handleGlobalPaste);
+    return () => window.removeEventListener('paste', handleGlobalPaste);
+  }, []);
+
+  // One-click clipboard paste button for screenshot or text
+  const handlePasteFromClipboardButton = async () => {
+    try {
+      if (navigator.clipboard?.read) {
+        const clipboardItems = await navigator.clipboard.read();
+        let foundImage = false;
+        for (const item of clipboardItems) {
+          for (const type of item.types) {
+            if (type.startsWith('image/')) {
+              const blob = await item.getType(type);
+              const file = new File([blob], `Screenshot_${Date.now()}.png`, { type });
+              processImageFile(file, true);
+              foundImage = true;
+              break;
+            }
+          }
+          if (foundImage) break;
+        }
+
+        if (foundImage) return;
+
+        // If no image, try text
+        const text = await navigator.clipboard.readText();
+        if (text && text.trim()) {
+          setInputMode('text');
+          setPastedExamText(text.trim());
+          setRetryNotice(`Đã nạp văn bản đề thi từ khay nhớ tạm!`);
+          setTimeout(() => setRetryNotice(null), 3000);
+          return;
+        }
+      }
+
+      // If clipboard API denied or empty, guide user to Ctrl+V
+      alert('Vui lòng nhấn phím Ctrl + V (hoặc Cmd + V trên Mac) trên bàn phím để dán ảnh chụp màn hình trực tiếp!');
+    } catch {
+      alert('Vui lòng nhấn phím Ctrl + V (hoặc Cmd + V trên Mac) trên bàn phím để dán ảnh chụp màn hình vào trang!');
+    }
+  };
+
+  // Handle file select (supports .doc, .docx, images, pdf, txt)
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -249,14 +379,20 @@ export default function App() {
       return;
     }
 
+    if (file.type.startsWith('image/')) {
+      processImageFile(file, false);
+      return;
+    }
+
     const reader = new FileReader();
     reader.onload = () => {
       const result = reader.result as string;
       const base64Data = result.split(',')[1];
+      const isDoc = file.name.toLowerCase().endsWith('.doc');
       setUploadedFile({
         file,
         base64Data,
-        mimeType: file.type || 'application/octet-stream',
+        mimeType: file.type || (isDoc ? 'application/msword' : 'application/octet-stream'),
         name: file.name,
         sizeFormatted: formatSize(file.size),
       });
@@ -400,6 +536,8 @@ export default function App() {
             if (attempt > 1) {
               setRetryNotice(`Đang thử phân tích lại cấu trúc đề mẫu lần ${attempt}...`);
               await new Promise((r) => setTimeout(r, 2000 * attempt));
+            } else {
+              setRetryNotice('Đang thực hiện quy trình 2 bước: Bước 1 chuyển sang chuẩn LaTeX ($...$) & Bước 2 OCR đề gốc chuẩn...');
             }
             const analyzeRes = await fetch('/api/exam/analyze', {
               method: 'POST',
@@ -416,6 +554,7 @@ export default function App() {
 
             currentBlueprint = analyzeData.blueprint;
             setBlueprint(analyzeData.blueprint);
+            setCurrentStepIndex(2);
             if (analyzeData.logs) setLogs(analyzeData.logs);
             if (analyzeData.activeModel) setActiveModel(analyzeData.activeModel);
             setRetryNotice(null);
@@ -696,6 +835,22 @@ export default function App() {
             <div className="flex-1">
               <div className="font-bold text-sm">Thông báo trạng thái hệ thống</div>
               <p className="text-xs mt-0.5 text-rose-700 leading-relaxed">{errorMessage}</p>
+              {(errorMessage.includes('504') || errorMessage.toLowerCase().includes('gateway timeout')) && (
+                <div className="mt-2.5 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setModelStrategy('fast_lite');
+                      setErrorMessage(null);
+                      handleAnalyzeAndGenerate();
+                    }}
+                    className="text-xs bg-rose-600 hover:bg-rose-700 text-white font-bold px-3 py-1.5 rounded-lg shadow-xs transition flex items-center gap-1.5"
+                  >
+                    <Zap className="w-3.5 h-3.5 text-amber-300" />
+                    Thử lại ngay với chế độ Siêu Tốc (Khắc phục lỗi 504)
+                  </button>
+                </div>
+              )}
             </div>
             <button
               onClick={() => setErrorMessage(null)}
@@ -847,32 +1002,44 @@ export default function App() {
                 5. Nạp đề mẫu để hệ thống quét và phân tích
               </label>
 
-              {/* Input Mode Selector */}
-              <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-xl border border-slate-200">
+              {/* Input Mode Selector + Clipboard Paste Button */}
+              <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => setInputMode('upload')}
-                  className={`text-xs px-3 py-1.5 rounded-lg font-bold transition flex items-center gap-1.5 ${
-                    inputMode === 'upload'
-                      ? 'bg-white text-blue-700 shadow-2xs'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
+                  onClick={handlePasteFromClipboardButton}
+                  className="text-xs px-3 py-1.5 rounded-xl font-bold transition flex items-center gap-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 shadow-2xs"
+                  title="Dán trực tiếp ảnh chụp màn hình từ khay nhớ tạm (hoặc nhấn Ctrl + V)"
                 >
-                  <FileText className="w-3.5 h-3.5" />
-                  Tải tệp đề (Word, PDF, Ảnh)
+                  <Clipboard className="w-3.5 h-3.5 text-indigo-600" />
+                  <span>Dán ảnh chụp (Ctrl+V)</span>
                 </button>
-                <button
-                  type="button"
-                  onClick={() => setInputMode('text')}
-                  className={`text-xs px-3 py-1.5 rounded-lg font-bold transition flex items-center gap-1.5 ${
-                    inputMode === 'text'
-                      ? 'bg-white text-blue-700 shadow-2xs'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  <Sparkles className="w-3.5 h-3.5" />
-                  Dán nội dung đề thi (Văn bản / LaTeX)
-                </button>
+
+                <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-xl border border-slate-200">
+                  <button
+                    type="button"
+                    onClick={() => setInputMode('upload')}
+                    className={`text-xs px-3 py-1.5 rounded-lg font-bold transition flex items-center gap-1.5 ${
+                      inputMode === 'upload'
+                        ? 'bg-white text-blue-700 shadow-2xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <FileText className="w-3.5 h-3.5" />
+                    Tệp đề (Word .doc/.docx, PDF, Ảnh)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setInputMode('text')}
+                    className={`text-xs px-3 py-1.5 rounded-lg font-bold transition flex items-center gap-1.5 ${
+                      inputMode === 'text'
+                        ? 'bg-white text-blue-700 shadow-2xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    Dán nội dung đề thi (Văn bản / LaTeX)
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -882,45 +1049,78 @@ export default function App() {
                   type="file"
                   ref={fileInputRef}
                   onChange={handleFileChange}
-                  accept=".jpg,.jpeg,.png,.pdf,.docx,.txt"
+                  accept=".jpg,.jpeg,.png,.webp,.pdf,.docx,.doc,.txt"
                   className="hidden"
                 />
 
                 {!uploadedFile ? (
                   <div
                     onClick={() => fileInputRef.current?.click()}
-                    className="border-2 border-dashed border-slate-300 hover:border-blue-500 bg-slate-50/50 hover:bg-blue-50/30 rounded-2xl p-8 text-center cursor-pointer transition group"
+                    className="border-2 border-dashed border-slate-300 hover:border-blue-500 bg-slate-50/50 hover:bg-blue-50/30 rounded-2xl p-7 text-center cursor-pointer transition group"
                   >
                     <div className="w-12 h-12 mx-auto rounded-full bg-blue-100 text-blue-600 flex items-center justify-center group-hover:scale-110 transition duration-200 mb-3">
                       <UploadCloud className="w-6 h-6" />
                     </div>
                     <div className="text-sm font-bold text-slate-800">
-                      Nhấp hoặc kéo thả tệp đề mẫu vào đây
+                      Nhấp chọn tệp hoặc kéo thả tệp đề mẫu vào đây
                     </div>
-                    <p className="text-xs text-slate-500 mt-1">
-                      Hỗ trợ: Word DOCX (quét 100% không sót câu), PDF scan, PDF văn bản, JPG, PNG (Tối đa 25MB)
+                    <p className="text-xs text-slate-500 mt-1 max-w-xl mx-auto">
+                      Hỗ trợ Word <span className="font-semibold text-slate-700">.doc (Word 97-2003)</span>, <span className="font-semibold text-slate-700">.docx</span>, PDF scan/chữ, JPG, PNG. Có thể dùng phím <kbd className="px-1.5 py-0.5 bg-slate-200 text-slate-800 rounded font-mono font-bold text-[11px]">Ctrl + V</kbd> để dán ảnh chụp màn hình ngay!
                     </p>
-                    <div className="mt-4 flex flex-wrap items-center justify-center gap-2 text-[11px] text-slate-500 font-medium">
-                      <span className="bg-white px-2 py-1 rounded border border-slate-200">Word .docx đầy đủ trắc nghiệm & tự luận</span>
-                      <span className="bg-white px-2 py-1 rounded border border-slate-200">Đề kèm hình vẽ hình học</span>
-                      <span className="bg-white px-2 py-1 rounded border border-slate-200">Công thức Math $x^2 + y^2$</span>
+                    <div className="mt-4 flex flex-wrap items-center justify-center gap-2 text-[11px] text-slate-600 font-medium">
+                      <span className="bg-white px-2 py-1 rounded border border-slate-200 flex items-center gap-1">
+                        <FileText className="w-3 h-3 text-blue-600" />
+                        Word .doc & .docx (quét 100% câu)
+                      </span>
+                      <span className="bg-white px-2 py-1 rounded border border-purple-200 text-purple-700 font-semibold flex items-center gap-1">
+                        <Camera className="w-3 h-3 text-purple-600" />
+                        Dán ảnh màn hình (Ctrl+V)
+                      </span>
+                      <span className="bg-white px-2 py-1 rounded border border-slate-200">
+                        Bảo toàn công thức Toán & Hình vẽ
+                      </span>
                     </div>
                   </div>
                 ) : (
-                  <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 flex items-center justify-between gap-4">
-                    <div className="flex items-center gap-3 min-w-0">
-                      <div className="w-10 h-10 rounded-xl bg-blue-600 text-white flex items-center justify-center shrink-0">
-                        <FileText className="w-5 h-5" />
-                      </div>
-                      <div className="min-w-0">
-                        <div className="text-sm font-bold text-slate-900 truncate">
-                          {uploadedFile.name}
+                  <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 flex flex-wrap sm:flex-nowrap items-center justify-between gap-4">
+                    <div className="flex items-center gap-3.5 min-w-0">
+                      {uploadedFile.previewUrl ? (
+                        <div className="w-14 h-14 rounded-xl overflow-hidden border border-slate-300 bg-white shrink-0 shadow-2xs group relative">
+                          <img
+                            src={uploadedFile.previewUrl}
+                            alt="Ảnh chụp đề thi"
+                            className="w-full h-full object-cover"
+                          />
                         </div>
-                        <div className="text-xs text-slate-500 flex items-center gap-2 mt-0.5">
+                      ) : (
+                        <div className="w-11 h-11 rounded-xl bg-blue-600 text-white flex items-center justify-center shrink-0 shadow-2xs">
+                          <FileText className="w-5 h-5" />
+                        </div>
+                      )}
+                      <div className="min-w-0">
+                        <div className="text-sm font-bold text-slate-900 truncate flex items-center gap-2">
+                          <span className="truncate">{uploadedFile.name}</span>
+                          {uploadedFile.isScreenshot && (
+                            <span className="text-[10px] bg-purple-100 text-purple-700 border border-purple-200 px-2 py-0.5 rounded-full font-bold shrink-0">
+                              Ảnh chụp màn hình
+                            </span>
+                          )}
+                          {uploadedFile.name.toLowerCase().endsWith('.doc') && (
+                            <span className="text-[10px] bg-amber-100 text-amber-800 border border-amber-200 px-2 py-0.5 rounded-full font-bold shrink-0">
+                              Word .doc
+                            </span>
+                          )}
+                          {uploadedFile.name.toLowerCase().endsWith('.docx') && (
+                            <span className="text-[10px] bg-sky-100 text-sky-800 border border-sky-200 px-2 py-0.5 rounded-full font-bold shrink-0">
+                              Word .docx
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-xs text-slate-500 flex flex-wrap items-center gap-2 mt-1">
                           <span>{uploadedFile.sizeFormatted}</span>
                           <span>•</span>
                           <span className="text-emerald-700 font-semibold bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
-                            ✓ Đã sẵn sàng quét toàn bộ đề
+                            ✓ Đã sẵn sàng quét & phân tích toàn bộ đề
                           </span>
                         </div>
                       </div>
@@ -929,10 +1129,19 @@ export default function App() {
                     <div className="flex items-center gap-2 shrink-0">
                       <button
                         type="button"
+                        onClick={handlePasteFromClipboardButton}
+                        className="text-xs text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 px-2.5 py-1.5 rounded-lg font-bold transition flex items-center gap-1"
+                        title="Dán đè ảnh chụp khác (Ctrl+V)"
+                      >
+                        <Clipboard className="w-3.5 h-3.5" />
+                        Dán lại ảnh (Ctrl+V)
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => fileInputRef.current?.click()}
                         className="text-xs text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 px-3 py-1.5 rounded-lg font-medium transition"
                       >
-                        Thay tệp
+                        Đổi tệp
                       </button>
                       <button
                         type="button"
@@ -1361,14 +1570,22 @@ export default function App() {
                     Mã đề: {currentExam.examCode} • Thời gian làm bài: {currentExam.durationMinutes || 45} phút • Tổng điểm: {currentExam.totalScore || 10} điểm
                   </p>
 
-                  <div className="pt-1 flex justify-center">
+                  <div className="pt-1 flex flex-wrap items-center justify-center gap-2">
                     <button
                       type="button"
-                      onClick={() => handleQuickDownloadSingle(currentExam)}
-                      className="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition shadow-sm flex items-center gap-2"
+                      onClick={() => handleQuickDownloadSingle(currentExam, false)}
+                      className="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition shadow-2xs flex items-center gap-1.5"
                     >
                       <Download className="w-4 h-4" />
-                      Tải ngay file Word của {currentExam.examCode} (.docx)
+                      Tải đề riêng (Không đáp án)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleQuickDownloadSingle(currentExam, true)}
+                      className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition shadow-2xs flex items-center gap-1.5"
+                    >
+                      <CheckCircle2 className="w-4 h-4" />
+                      Tải đề kèm đáp án & lời giải
                     </button>
                   </div>
                 </div>
@@ -1425,12 +1642,73 @@ export default function App() {
                     </span>
                   </div>
 
-                  {blueprint.warnings && blueprint.warnings.length > 0 && (
-                    <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 text-xs text-amber-900">
-                      <span className="font-bold">Lưu ý phân tích: </span>
-                      {blueprint.warnings.join(' ')}
+                  {/* TWO-STEP VERIFICATION DISPLAY */}
+                  <div className="p-4 bg-indigo-50/60 rounded-xl border border-indigo-200/80 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className="px-2 py-0.5 rounded-md bg-indigo-600 text-white text-xs font-bold">
+                          Bước 1
+                        </span>
+                        <span className="font-bold text-xs text-indigo-950">
+                          Văn bản đề gốc đã số hóa & chuyển đổi chuẩn LaTeX ($...$)
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        {blueprint.transcribedLatexText && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              navigator.clipboard.writeText(blueprint.transcribedLatexText || '');
+                              setCopiedLatex(true);
+                              setTimeout(() => setCopiedLatex(false), 3000);
+                            }}
+                            className="text-xs bg-white hover:bg-slate-50 text-indigo-700 font-semibold px-2.5 py-1 rounded-lg border border-indigo-200 transition flex items-center gap-1 shadow-2xs"
+                          >
+                            {copiedLatex ? (
+                              <>
+                                <Check className="w-3.5 h-3.5 text-emerald-600" />
+                                <span>Đã chép</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3.5 h-3.5 text-indigo-600" />
+                                <span>Sao chép LaTeX</span>
+                              </>
+                            )}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => setShowLatexSource(!showLatexSource)}
+                          className="text-xs bg-indigo-100 hover:bg-indigo-200 text-indigo-900 font-semibold px-2.5 py-1 rounded-lg transition flex items-center gap-1"
+                        >
+                          <Code className="w-3.5 h-3.5" />
+                          <span>{showLatexSource ? 'Thu gọn' : 'Xem văn bản LaTeX'}</span>
+                        </button>
+                      </div>
                     </div>
-                  )}
+
+                    <p className="text-[11px] text-indigo-900/80 leading-relaxed">
+                      ✓ Toàn bộ công thức Toán học, biến số, căn, phân thức, góc, hình học được bọc dấu <code className="bg-white px-1.5 py-0.5 rounded text-indigo-700 font-mono font-bold">$...$</code> chính xác trước khi chuyển sang Bước 2 phân tích cấu trúc đề.
+                    </p>
+
+                    {showLatexSource && blueprint.transcribedLatexText && (
+                      <div className="mt-2 bg-slate-900 text-slate-100 rounded-xl p-3.5 text-xs font-mono leading-relaxed max-h-72 overflow-y-auto whitespace-pre-wrap select-text border border-slate-700">
+                        {blueprint.transcribedLatexText}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Header Bước 2 */}
+                  <div className="flex items-center gap-2 pt-2 border-t border-slate-100">
+                    <span className="px-2 py-0.5 rounded-md bg-blue-600 text-white text-xs font-bold">
+                      Bước 2
+                    </span>
+                    <h4 className="text-xs font-bold text-slate-900">
+                      Bản đồ cấu trúc đề chuẩn đã OCR & bóc tách ({blueprint.questions.length} câu)
+                    </h4>
+                  </div>
 
                   <div className="space-y-3 pt-2">
                     {blueprint.questions.map((q) => (

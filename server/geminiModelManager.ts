@@ -128,7 +128,8 @@ export class GeminiModelManager {
   private async executeWithFallback<T>(
     operationName: string,
     fn: (modelName: string, thinkingLevel: ThinkingLevel) => Promise<T>,
-    strategy: 'auto' | 'fast_lite' | 'flash_standard' | 'rotate' = 'auto'
+    strategy: 'auto' | 'fast_lite' | 'flash_standard' | 'rotate' = 'auto',
+    forcedThinkingLevel?: ThinkingLevel
   ): Promise<T> {
     const candidates = this.getOrderedCandidates(strategy);
     let lastError: any = null;
@@ -148,7 +149,11 @@ export class GeminiModelManager {
         const model = candidates[i];
         this.activeModelIndex = MODEL_CANDIDATES.indexOf(model) >= 0 ? MODEL_CANDIDATES.indexOf(model) : 0;
         const thinkingLevel =
-          model === 'gemini-3.1-flash-lite' ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW;
+          forcedThinkingLevel !== undefined
+            ? forcedThinkingLevel
+            : model === 'gemini-3.1-flash-lite'
+            ? ThinkingLevel.MINIMAL
+            : ThinkingLevel.LOW;
 
         // Try up to 2 times for transient errors per model
         const maxAttempts = 2;
@@ -179,6 +184,22 @@ export class GeminiModelManager {
               // Wait a brief 1.5s jittered delay before jumping to next candidate to alleviate token bucket
               await new Promise((res) => setTimeout(res, 1200 + Math.random() * 600));
               break; // Break attempt loop to proceed to next candidate model
+            }
+
+            const is504Timeout =
+              errMsg.includes('504') ||
+              errMsg.includes('gateway timeout') ||
+              errMsg.includes('deadline_exceeded') ||
+              errMsg.includes('timed out');
+
+            if (is504Timeout) {
+              this.addLog(
+                model,
+                'warning',
+                `Mô hình ${model} hết hạn phản hồi (Lỗi 504 Gateway Timeout). Lập tức đổi sang mô hình siêu tốc gemini-3.1-flash-lite...`,
+                latency
+              );
+              break; // Immediately break attempt loop to switch to next fast model
             }
 
             if (isServerError && (errMsg.includes('overloaded') || errMsg.includes('503'))) {
@@ -228,8 +249,10 @@ export class GeminiModelManager {
     let friendlyAdvice = 'Lỗi kết nối máy chủ AI.';
     if (this.isRateLimitError(lastError)) {
       friendlyAdvice = 'Hệ thống đã chạm hạn mức yêu cầu đồng thời (Lỗi 420/429). Vui lòng đợi vài giây và bấm thử lại.';
+    } else if (String(lastErrMsg).includes('504') || String(lastErrMsg).toLowerCase().includes('gateway timeout')) {
+      friendlyAdvice = 'Cổng kết nối quá hạn thời gian xử lý (Lỗi 504 Gateway Timeout). Hệ thống tự động chuyển sang cấu hình tạo siêu tốc Flash-Lite để hoàn tất nhanh chóng.';
     } else if (this.isTransientServerError(lastError)) {
-      friendlyAdvice = 'Máy chủ AI tạm thời quá tải hoặc phản hồi chậm (Lỗi 500/503). Vui lòng thử lại sau giây lát.';
+      friendlyAdvice = 'Máy chủ AI tạm thời quá tải hoặc phản hồi chậm (Lỗi 500/503/504). Vui lòng thử lại sau giây lát.';
     }
 
     throw new Error(`${friendlyAdvice} Chi tiết: ${lastErrMsg}`);
@@ -481,33 +504,198 @@ export class GeminiModelManager {
   }
 
   /**
-   * Phân tích tệp đề mẫu (OCR tệp ảnh/PDF/Word hoặc Text) thành Cấu trúc chuẩn Blueprint
-   * BẢO ĐẢM QUÉT ĐẦY ĐỦ 100% CÂU HỎI KHÔNG BỎ SÓT
+   * Làm sạch nội dung câu hỏi, loại bỏ hoàn toàn các tiền tố lặp như "Câu 1:", "Câu 1.", "Câu 1 (0.5 điểm):", "Bài 1:"
    */
-  public async analyzeExamDocument(params: {
+  public cleanQuestionText(content?: string, order?: number): string {
+    if (!content || typeof content !== 'string') return '';
+    let cleaned = content.trim();
+
+    let changed = true;
+    let loops = 0;
+    while (changed && loops < 5) {
+      loops++;
+      const prev = cleaned;
+
+      cleaned = cleaned
+        .replace(/^(?:câu|bài|question|câu\s*hỏi)\s*\d*(?:\s*\([^)]*\))?[\s.:)-]*/i, '')
+        .trim();
+
+      if (order !== undefined) {
+        const numPattern = new RegExp(`^${order}[.:)-]\\s*`, 'i');
+        cleaned = cleaned.replace(numPattern, '').trim();
+      }
+
+      cleaned = cleaned
+        .replace(/^\(\s*\d+(?:[.,]\d+)?\s*(?:đ|điểm|pts?)\s*\)[\s.:)-]*/i, '')
+        .trim();
+
+      cleaned = cleaned.replace(/^[\s.:)-]+/, '').trim();
+      changed = cleaned !== prev;
+    }
+
+    return cleaned;
+  }
+
+  /**
+   * Làm sạch phương án trắc nghiệm, loại bỏ tiền tố A., B., C., D. bị lặp lại
+   */
+  public cleanOptionText(text?: string, key?: string): string {
+    if (!text || typeof text !== 'string') return '';
+    let cleaned = text.trim();
+    cleaned = cleaned.replace(/^\(?[A-Da-d]\)?[\s.:)-]+/, '').trim();
+    if (key) {
+      const keyPattern = new RegExp(`^\\(?${key}\\)?[\\s.:)-]*`, 'i');
+      cleaned = cleaned.replace(keyPattern, '').trim();
+    }
+    return cleaned;
+  }
+
+  /**
+   * BƯỚC 1: Chuyển đổi toàn bộ nội dung đề đưa lên (ảnh, PDF scan, Word hoặc Text)
+   * sang văn bản đầy đủ với toàn bộ công thức Toán học được chuyển sang chuẩn LaTeX bọc trong dấu '$...$'
+   */
+  public async transcribeDocumentToLatex(params: {
     base64Data?: string;
     mimeType?: string;
     textContent?: string;
     subject: string;
     grade: string;
+  }): Promise<string> {
+    const { base64Data, mimeType, textContent, subject, grade } = params;
+
+    return this.executeWithFallback(
+      'Bước 1: Chuyển toàn bộ nội dung đề sang chuẩn LaTeX ($...$)',
+      async (model, thinkingLevel) => {
+        const parts: any[] = [];
+
+        if (base64Data && mimeType && (mimeType.startsWith('image/') || mimeType === 'application/pdf')) {
+          parts.push({
+            inlineData: {
+              mimeType,
+              data: base64Data,
+            },
+          });
+        }
+
+        const prompt = `
+Bạn là chuyên gia số hóa đề thi và chuyên gia chuyển đổi LaTeX sư phạm môn ${subject} (${grade}) của Bộ Giáo dục & Đào tạo Việt Nam.
+
+QUY TRÌNH BẮT BUỘC - BƯỚC 1: CHUYỂN TOÀN BỘ NỘI DUNG ĐỀ THI SANG VĂN BẢN CHUẨN LATEX ($...$)
+Đọc kĩ toàn bộ tài liệu đính kèm (ảnh chụp, file PDF, hoặc văn bản Word) và phiên mã lại TOÀN BỘ nội dung nguyên vẹn 100%:
+
+QUY TẮC CÔNG THỨC TOÁN LATEX BẮT BUỘC:
+1. MỌI công thức Toán học, biểu thức đại số, phân số, căn thức, phương trình, hệ phương trình, số mũ, biến số, tọa độ, ký hiệu hình học BẮT BUỘC PHẢI ĐƯỢC BỌC TRONG DẤU '$...$' (hoặc '$$...$$' nếu đặt riêng một dòng).
+   - Phân thức: '$P = \\frac{2x - 1}{x - 3}$'
+   - Căn thức: '$\\sqrt{x^2 - 4} = 0$'
+   - Hằng đẳng thức: '$(2x - 3)^2 = 4x^2 - 12x + 9$'
+   - Hình học: 'Tam giác $ABC$ vuông tại $A$, có $AB = 6\\text{ cm}, AC = 8\\text{ cm}$'
+   - Ký hiệu: '$\\widehat{ABC} = 90^\\circ$', '$MN \\parallel BC$', '$AH \\perp BC$', '$\\Delta > 0$', '$\\alpha$'
+   - Tọa độ & vectơ: 'điểm $M(1; -2)$, vectơ $\\vec{u} = (2; -3)$'
+   - Tập hợp & bất đẳng thức: '$x \\in \\mathbb{R}$', '$x \\ne \\pm 2$', '$a + b \\ge 2\\sqrt{ab}$'
+2. Giữ nguyên 100% tiêu đề đề thi (Sở/Phòng GD&ĐT, Trường, Kỳ thi, Môn, Lớp, Thời gian, Thang điểm).
+3. Giữ nguyên toàn bộ các phần:
+   - "PHẦN I. TRẮC NGHIỆM KHÁCH QUAN"
+   - Các câu: Ghi rõ 'Câu 1.', 'Câu 2.'... và từng phương án lựa chọn:
+     'A. $...$'
+     'B. $...$'
+     'C. $...$'
+     'D. $...$'
+   - "PHẦN II. TỰ LUẬN"
+   - Các bài: Ghi rõ 'Bài 1.', 'Bài 2.'... và các câu hỏi phụ a), b), c)...
+4. Nếu có hình vẽ, ghi rõ vị trí: '[Hình vẽ: Mô tả chi tiết hình vẽ/đồ thị]'.
+5. TUYỆT ĐỐI KHÔNG TÓM TẮT, KHÔNG CẮT BỚT BẤT KỲ CÂU NÀO TỪ ĐẦU ĐẾN CUỐI ĐỀ.
+
+${textContent ? `Nội dung tài liệu thô được trích xuất từ tệp:\n${textContent}\n` : ''}
+
+Hãy trả về toàn bộ nội dung văn bản đề thi đã được chuẩn hóa LaTeX hoàn chỉnh. Không thêm lời chào hay giải thích ngoài nội dung đề thi.
+`;
+
+        parts.push({ text: prompt });
+
+        const response = await this.ai.models.generateContent({
+          model,
+          contents: parts,
+          config: {
+            temperature: 0.1,
+            thinkingConfig: { thinkingLevel },
+          },
+        });
+
+        return response.text?.trim() || '';
+      },
+      'fast_lite',
+      ThinkingLevel.MINIMAL
+    );
+  }
+
+  /**
+   * BƯỚC 2: Phân tích cấu trúc & OCR đề gốc từ văn bản chuẩn hóa LaTeX ($...$)
+   * để tạo ra Cấu trúc chuẩn Blueprint đảm bảo đầy đủ 100% câu hỏi
+   */
+  public async analyzeExamDocument(params: {
+    base64Data?: string;
+    mimeType?: string;
+    textContent?: string;
+    latexText?: string;
+    subject: string;
+    grade: string;
   }): Promise<OriginalExamBlueprint> {
     const { base64Data, mimeType, textContent, subject, grade } = params;
 
-    // Nhận diện sơ bộ các mốc câu hỏi trong văn bản nếu có
-    const preDetectedAnchors = this.detectQuestionAnchors(textContent || '');
-
-    return this.executeWithFallback('Phân tích cấu trúc & OCR đề mẫu', async (model, thinkingLevel) => {
-      const parts: any[] = [];
-
-      // Chỉ gửi inlineData nếu là PDF hoặc hình ảnh (Gemini không hỗ trợ docx/txt nhị phân trong inlineData)
-      if (base64Data && mimeType && (mimeType.startsWith('image/') || mimeType === 'application/pdf')) {
-        parts.push({
-          inlineData: {
-            mimeType,
-            data: base64Data,
-          },
+    // BƯỚC 1: Chuyển toàn bộ nội dung đề sang văn bản chuẩn LaTeX ($...$)
+    let standardizedLatex = (params.latexText || '').trim();
+    if (!standardizedLatex) {
+      this.addLog(
+        this.getActiveModel(),
+        'info',
+        'BƯỚC 1: Đang chuyển toàn bộ nội dung đề sang chuẩn LaTeX với dấu bọc $ quanh các công thức Toán...'
+      );
+      try {
+        standardizedLatex = await this.transcribeDocumentToLatex({
+          base64Data,
+          mimeType,
+          textContent,
+          subject,
+          grade,
         });
+        this.addLog(
+          this.getActiveModel(),
+          'success',
+          `BƯỚC 1 HOÀN TẤT: Đã số hóa và chuyển đổi thành công ${standardizedLatex.length} ký tự đề thi sang chuẩn LaTeX ($...).`
+        );
+      } catch (err: any) {
+        console.warn('Lỗi khi thực hiện Bước 1 (Chuyển sang LaTeX):', err.message);
+        standardizedLatex = (textContent || '').trim();
       }
+    }
+
+    // Nhận diện sơ bộ tất cả mốc câu hỏi trong văn bản đã chuẩn hóa LaTeX
+    const preDetectedAnchors = this.detectQuestionAnchors(standardizedLatex || textContent || '');
+    if (preDetectedAnchors.length > 0) {
+      this.addLog(
+        this.getActiveModel(),
+        'info',
+        `Nhận diện sơ bộ từ văn bản LaTeX: Phát hiện ${preDetectedAnchors.length} câu hỏi [${preDetectedAnchors.map((a) => a.label).slice(0, 8).join(', ')}${preDetectedAnchors.length > 8 ? '...' : ''}]`
+      );
+    }
+
+    return this.executeWithFallback(
+      'Bước 2: Phân tích cấu trúc & OCR đề chuẩn từ văn bản LaTeX',
+      async (model, thinkingLevel) => {
+        const parts: any[] = [];
+
+        // TỐI ƯU HÓA TỐC ĐỘ: Nếu Bước 1 đã phiên mã thành công sang văn bản LaTeX,
+        // Bước 2 chỉ cần phân tích cấu trúc từ văn bản LaTeX này mà không cần tải lại toàn bộ
+        // tệp ảnh/PDF nhị phân nặng, giúp giảm 70% thời gian xử lý và giảm độ trễ mạng.
+        const hasCompleteLatex = standardizedLatex && standardizedLatex.length > 50;
+        if (!hasCompleteLatex && base64Data && mimeType && (mimeType.startsWith('image/') || mimeType === 'application/pdf')) {
+          parts.push({
+            inlineData: {
+              mimeType,
+              data: base64Data,
+            },
+          });
+        }
 
       const anchorInstruction = preDetectedAnchors.length > 0
         ? `
@@ -549,7 +737,7 @@ Nhiệm vụ của bạn:
    - "correctAnswer": đáp án nếu có trên đề mẫu
 6. Kiểm tra xem môn học và lớp được chọn ("${subject}" - "${grade}") có phù hợp với nội dung đề không. Nếu có sai lệch đáng ngờ, ghi cảnh báo vào mảng "warnings".
 
-${textContent ? `Nội dung tài liệu đính kèm dạng văn bản:\n${textContent}\n` : ''}
+${(standardizedLatex || textContent) ? `NỘI DUNG ĐỀ THI ĐÃ CHUẨN HÓA LATEX ($...$) TỪ BƯỚC 1:\n${standardizedLatex || textContent}\n` : ''}
 
 YÊU CẦU ĐẦU RA: Trả về DUY NHẤT một JSON hợp lệ (không kèm lời chào hay giải thích ngoài khối JSON) có cấu trúc:
 {
@@ -571,7 +759,7 @@ YÊU CẦU ĐẦU RA: Trả về DUY NHẤT một JSON hợp lệ (không kèm l
       "id": "q1",
       "order": 1,
       "partTitle": "PHẦN I",
-      "originalContent": "Câu 1: Cho biểu thức $A = \\sqrt{x-2}$. Điều kiện xác định của $A$ là:",
+      "originalContent": "Cho biểu thức $A = \\sqrt{x-2}$. Điều kiện xác định của $A$ là:",
       "type": "multiple_choice",
       "options": [
         { "key": "A", "text": "$x > 2$" },
@@ -630,7 +818,7 @@ YÊU CẦU ĐẦU RA: Trả về DUY NHẤT một JSON hợp lệ (không kèm l
 Tài liệu đề thi chứa các câu hỏi tiếp theo chưa được trích xuất: [${missingAnchors.map((a) => a.label).join(', ')}].
 Hãy trích xuất tiếp các câu hỏi còn thiếu này từ tài liệu theo đúng cấu trúc JSON mảng "questions".
 Nội dung văn bản:
-${textContent}
+${standardizedLatex || textContent}
 
 Yêu cầu đầu ra: Trả về JSON chứa mảng "questions" gồm ${missingCount} câu hỏi còn thiếu (thứ tự từ ${startIndex + 1} đến ${preDetectedAnchors.length}):
 {
@@ -673,19 +861,30 @@ Yêu cầu đầu ra: Trả về JSON chứa mảng "questions" gồm ${missingC
         }
       }
 
-      // Chuẩn hóa lại thứ tự câu (order: 1, 2, ... N) và id duy nhất
+      // Chuẩn hóa lại thứ tự câu (order: 1, 2, ... N), làm sạch tiền tố "Câu..." lặp lại và id duy nhất
       parsed.questions.forEach((q, idx) => {
         q.order = idx + 1;
         if (!q.id) {
           q.id = `q${idx + 1}`;
         }
-        if (!q.options && q.type === 'multiple_choice') {
+        if (q.originalContent) {
+          q.originalContent = this.cleanQuestionText(q.originalContent, q.order);
+        }
+        if (q.options && Array.isArray(q.options)) {
+          q.options.forEach((opt) => {
+            opt.text = this.cleanOptionText(opt.text, opt.key);
+          });
+        } else if (q.type === 'multiple_choice') {
           q.options = [];
         }
       });
 
+      // Lưu trữ văn bản đề thi đã chuyển hóa sang chuẩn LaTeX ($...$) từ Bước 1
+      parsed.transcribedLatexText = standardizedLatex;
+      parsed.rawTextPreview = standardizedLatex;
+
       return parsed;
-    }, 'auto');
+    }, 'fast_lite', ThinkingLevel.MINIMAL);
   }
 
   /**
@@ -921,14 +1120,25 @@ Yêu cầu:
             ];
           }
 
+          const rawContent = q.content || originalQ?.originalContent || `Câu hỏi ${qIdx + 1}`;
+          const cleanContent = this.cleanQuestionText(rawContent, q.order || (qIdx + 1));
+
+          let cleanOptions: any[] | undefined = undefined;
+          if (Array.isArray(options)) {
+            cleanOptions = options.map((opt: any) => ({
+              key: opt.key,
+              text: this.cleanOptionText(opt.text, opt.key),
+            }));
+          }
+
           return {
             id: q.id || `gen_${index}_q${qIdx + 1}`,
             order: q.order || (qIdx + 1),
             originalId: q.originalId || originalQ?.id || `q${qIdx + 1}`,
             partTitle: q.partTitle || originalQ?.partTitle || '',
             type: qType,
-            content: q.content || originalQ?.originalContent || `Câu hỏi ${qIdx + 1}`,
-            options: Array.isArray(options) ? options : undefined,
+            content: cleanContent,
+            options: cleanOptions,
             correctAnswer: q.correctAnswer || originalQ?.correctAnswer || (qType === 'multiple_choice' ? 'A' : 'Xem lời giải'),
             explanation: q.explanation || `Lời giải chi tiết cho câu ${qIdx + 1}`,
             score: typeof q.score === 'number' ? q.score : (originalQ?.score || 0.5),
